@@ -1,0 +1,2910 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import vm from 'node:vm';
+import { randomUUID } from 'node:crypto';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { gunzipSync } from 'node:zlib';
+import { composePrompt, createAlToqueServer, detectMenuIntent, getAssistantPersona, getLocalMenuAnswer, makeRiderSupportInstructions, selectMenuItem, shouldUseWebSearch, styleLocalAnswer } from './server.mjs';
+
+async function createReelsTestServer(t, testDataDir, reelsDeletePassword = 'test-reels-delete-password') {
+  const server = createAlToqueServer({
+    ordersFile: join(testDataDir, 'orders.json'),
+    reelsFile: join(testDataDir, 'reels.json'),
+    complaintsFile: join(testDataDir, 'complaints.json'),
+    reelsVideosDir: join(testDataDir, 'reels-videos'),
+    reelsDeletePassword
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(async () => {
+    if (server.listening) {
+      await new Promise((resolve, reject) => {
+        server.close((error) => error ? reject(error) : resolve());
+      });
+    }
+    await rm(testDataDir, { recursive: true, force: true });
+  });
+  return server;
+}
+
+test('uses and serves the tablet app photos for the mobile order catalog', async () => {
+  const assetNames = [
+    'desayuno-emoliente-pan-queso-nueva.png',
+    'lomo-saltado-imagen.png',
+    'bowl-quinua-imagen.png',
+    'ceviche-carretillero-imagen.png',
+    'combo-herediano-imagen.png',
+    'combo-fitness-imagen.png',
+    'combo-costeno-imagen.png',
+    'combo-marino-final-imagen.png',
+    'chicha-morada-helada.png',
+    'agua-san-luis-natural.png',
+    'jugo-maracuya-helada.png'
+  ];
+  const [html, serverSource, ...assets] = await Promise.all([
+    readFile(join(process.cwd(), 'Al-toque-pe-mejorado.html'), 'utf8'),
+    readFile(join(process.cwd(), 'server.mjs'), 'utf8'),
+    ...assetNames.map((name) => readFile(join(process.cwd(), name)))
+  ]);
+  const publicAssets = serverSource.match(/const PUBLIC_ASSETS = new Set\(\[([\s\S]*?)\n\]\);/)?.[1] || '';
+  const menuImagesBlock = html.match(/window\.MENU_IMAGES = \{[\s\S]*?\n    \};/)?.[0];
+  assert.ok(menuImagesBlock, 'mobile catalog photo mapping should exist');
+  const menuImagesSource = menuImagesBlock
+    .replace('window.MENU_IMAGES = ', '')
+    .replace(/;$/, '');
+  const menuImages = JSON.parse(JSON.stringify(vm.runInNewContext(`(${menuImagesSource})`)));
+  assert.deepEqual(menuImages, {
+    herediano: './combo-herediano-imagen.png',
+    fitness: './combo-fitness-imagen.png',
+    marino: './combo-marino-final-imagen.png',
+    lomo: './lomo-saltado-imagen.png',
+    quinua: './bowl-quinua-imagen.png',
+    chicha: './chicha-morada-helada.png',
+    maracuya: './jugo-maracuya-helada.png',
+    agua: './agua-san-luis-natural.png',
+    costeno: './combo-costeno-imagen.png'
+  });
+  const initialMenu = html.match(/const INITIAL_MENU = \[([\s\S]*?)\n    \];/)?.[1] || '';
+  for (const key of Object.keys(menuImages)) {
+    assert.ok(initialMenu.includes(`image: window.MENU_IMAGES.${key}`), `${key} should use the tablet photo`);
+  }
+  assert.match(html, /<img src=\{item\.image\} alt=\{item\.name\} className="w-12 h-12 rounded-xl object-cover" \/>/);
+
+  assert.match(initialMenu, /image: '\.\/desayuno-emoliente-pan-queso-nueva\.png'/);
+  assert.match(initialMenu, /image: '\.\/ceviche-carretillero-imagen\.png'/);
+  for (const [index, asset] of assets.entries()) {
+    assert.ok(publicAssets.includes(`'${assetNames[index]}'`), `${assetNames[index]} must be served by the app`);
+    assert.equal(asset.subarray(0, 8).toString('hex'), '89504e470d0a1a0a', `${assetNames[index]} must be a valid PNG`);
+  }
+});
+
+test('expands order photos only while hovered or touched', async () => {
+  const html = await readFile(join(process.cwd(), 'Al-toque-pe-mejorado.html'), 'utf8');
+  const cartStart = html.indexOf('function CartScreen(');
+  const cartEnd = html.indexOf('\n    function ', cartStart + 1);
+  const cartScreen = html.slice(cartStart, cartEnd);
+
+  assert.ok(cartStart >= 0 && cartEnd > cartStart);
+  assert.match(cartScreen, /<div className="order-item-photo h-12 w-12 shrink-0 rounded-xl"/);
+  assert.match(cartScreen, /<img src=\{item\.image\} alt=\{item\.name\} \/>/);
+  assert.match(html, /@media \(hover: hover\) and \(pointer: fine\) \{\s*\.order-item-photo:hover/);
+  assert.match(html, /\.order-item-photo:active/);
+  assert.match(html, /transform: scale\(2\.4\)/);
+  assert.match(html, /prefers-reduced-motion: reduce[\s\S]*?\.order-item-photo img \{ transition: none; \}/);
+});
+
+test('records Libro de Reclamaciones submissions privately and validates required details', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const pageResponse = await fetch(baseUrl);
+  const html = await pageResponse.text();
+  assert.equal(pageResponse.status, 200);
+  assert.match(html, /Libro de Reclamaciones virtual/);
+  assert.match(html, /20054389212/);
+  assert.match(html, /Av\. Armendáriz 497, Miraflores 15074/);
+  assert.ok(html.indexOf('Ayuda</h5>') < html.indexOf('Libro de Reclamaciones virtual'));
+  assert.match(html, /className="complaint-book-card w-full cursor-pointer"/);
+  assert.match(html, /viewBox="0 0 100 112"/);
+  assert.match(html, /@keyframes complaintBookCardShine/);
+  assert.match(html, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.complaint-book-card::after,[\s\S]*?\.complaint-book-page \{ animation: none !important; \}/);
+  const complaint = {
+    kind: 'reclamo',
+    consumerName: 'Ana Ejemplo',
+    documentType: 'DNI',
+    documentNumber: '12345678',
+    address: 'Av. Universitaria 123, Lima',
+    email: 'ana@example.com',
+    phone: '987654321',
+    product: 'Combo de almuerzo',
+    amount: '15.50',
+    description: 'El pedido llegó incompleto y faltaba una bebida que ya había pagado.',
+    request: 'Solicito la devolución del monto de la bebida faltante.',
+    privacyConsent: true
+  };
+
+  const invalidResponse = await fetch(`${baseUrl}/api/complaints`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({ ...complaint, privacyConsent: false })
+  });
+  assert.equal(invalidResponse.status, 400);
+  assert.match((await invalidResponse.json()).error, /Debes aceptar/);
+
+  const response = await fetch(`${baseUrl}/api/complaints`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify(complaint)
+  });
+  assert.equal(response.status, 201);
+  const { complaint: receipt } = await response.json();
+  assert.match(receipt.id, /^AT-[A-Z0-9]+-[A-F0-9]{8}$/);
+  assert.ok(Number.isFinite(Date.parse(receipt.submittedAt)));
+
+  const persisted = JSON.parse(await readFile(join(testDataDir, 'complaints.json'), 'utf8'));
+  assert.equal(persisted.complaints.length, 1);
+  assert.equal(persisted.complaints[0].email, complaint.email);
+  assert.equal(persisted.complaints[0].amount, 15.5);
+  assert.equal(persisted.complaints[0].privacyConsentAt, receipt.submittedAt);
+
+  const publicReadResponse = await fetch(`${baseUrl}/api/complaints`);
+  assert.equal(publicReadResponse.status, 405);
+  const crossOriginResponse = await fetch(`${baseUrl}/api/complaints`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: 'https://other.example' },
+    body: JSON.stringify(complaint)
+  });
+  assert.equal(crossOriginResponse.status, 403);
+});
+
+async function createReelsTestDirectory() {
+  return mkdtemp(join(process.cwd(), `.reels-test-${randomUUID()}-`));
+}
+
+test('serves the Reel watermark image as a public PNG asset', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/al-toque-reel-watermark.png`);
+  const image = Buffer.from(await response.arrayBuffer());
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-type'), 'image/png');
+  assert.equal(image.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+});
+
+test('serves the PartyKub logo and includes its launcher on the home screen', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const imageResponse = await fetch(`${baseUrl}/partykub-logo.png`);
+  const image = Buffer.from(await imageResponse.arrayBuffer());
+  const pageResponse = await fetch(baseUrl);
+  const html = await pageResponse.text();
+
+  assert.equal(imageResponse.status, 200);
+  assert.equal(imageResponse.headers.get('content-type'), 'image/png');
+  assert.equal(image.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+  assert.equal(pageResponse.status, 200);
+  assert.match(html, /aria-label="PartyKub, juego próximamente"/);
+  assert.match(html, /<img src="\/partykub-logo\.png" alt="" aria-hidden="true" \/>/);
+  assert.match(html, /\.partykub-launcher\s*\{\s*display:\s*grid;\s*width:\s*52px;\s*height:\s*52px;/);
+});
+
+test('serves the transparent Miraflores logo as a public PNG asset', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/miraflores-logo-transparent.png`);
+  const image = Buffer.from(await response.arrayBuffer());
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-type'), 'image/png');
+  assert.equal(image.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+  assert.equal(image[25], 6, 'the PNG should retain its alpha channel');
+});
+
+test('shows the Miraflores delivery schedule and updates its status using Lima time', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/`);
+  const html = await response.text();
+  const statusFunction = html.match(/function getCampusServiceStatus\(date = new Date\(\)\) \{[\s\S]*?\n    \}/);
+
+  assert.equal(response.status, 200);
+  assert.ok(statusFunction, 'the home screen should calculate the campus service status');
+  assert.match(html, /<link rel="preload" href="\/vendor\/fonts\/coiny-400\.ttf\?v=2" as="font" type="font\/ttf" crossorigin\s*\/?>/,
+    'the rounded delivery font should preload before the first paint');
+  assert.match(html, /<link href="\/vendor\/fonts\.css\?v=2" rel="stylesheet"\s*\/?>/,
+    'the rounded font stylesheet should use a fresh cache key');
+  const getCampusServiceStatus = vm.runInNewContext(`(${statusFunction[0]})`, { Intl });
+  const cases = [
+    ['2026-01-15T09:59:00-05:00', 'offline', '10:00 a. m.'],
+    ['2026-01-15T10:00:00-05:00', 'online', '1:20 p. m.'],
+    ['2026-01-15T13:19:00-05:00', 'online', '1:20 p. m.'],
+    ['2026-01-15T13:20:00-05:00', 'offline', 'Retomamos los pedidos a la 1:30 p. m.'],
+    ['2026-01-15T13:29:00-05:00', 'offline', 'Retomamos los pedidos a la 1:30 p. m.'],
+    ['2026-01-15T13:30:00-05:00', 'online', '6:00 p. m.'],
+    ['2026-01-15T17:59:00-05:00', 'online', '6:00 p. m.'],
+    ['2026-01-15T18:00:00-05:00', 'offline', '8:00 p. m.'],
+    ['2026-01-15T19:59:00-05:00', 'offline', '8:00 p. m.'],
+    ['2026-01-15T20:00:00-05:00', 'online', '10:00 p. m.'],
+    ['2026-01-15T21:59:00-05:00', 'online', '10:00 p. m.'],
+    ['2026-01-15T22:00:00-05:00', 'offline', '10:00 a. m. de mañana']
+  ];
+
+  for (const [timestamp, expectedState, expectedDetail] of cases) {
+    const status = getCampusServiceStatus(new Date(timestamp));
+    assert.equal(status.state, expectedState, `unexpected state at ${timestamp}`);
+    assert.ok(status.detail.includes(expectedDetail), `unexpected detail at ${timestamp}`);
+  }
+
+  assert.match(html, /className=\{`campus-service-card \$\{serviceStatus\.state === 'online' \? 'campus-service-card--online' : 'campus-service-card--offline'\} \$\{isServiceCardExpanded \? 'campus-service-card--expanded' : ''\}`\}/);
+  assert.match(html, /className="home-feature-carousel" aria-label="Información del campus" aria-roledescription="carrusel"/);
+  assert.match(html, /setHomeCarousel\(\(carousel\) => \(\{[\s\S]*?active: \(carousel\.active \+ 1\) % 3,[\s\S]*?exiting: carousel\.active[\s\S]*?\}, 30000\);/);
+  assert.match(html, /setHomeCarousel\(\(carousel\) => \(\{ \.\.\.carousel, exiting: null \}\)\)[\s\S]*?\}, 700\);/);
+  assert.match(html, /\.home-feature-slide\s*\{[^}]*transform: translateX\(100%\);[^}]*visibility: hidden;/);
+  assert.match(html, /\.home-feature-slide--exit-left\s*\{[^}]*transform: translateX\(-100%\);/);
+  assert.match(html, /@media \(prefers-reduced-motion: reduce\)\s*\{\s*\.home-feature-slide--active,[\s\S]*?\.home-feature-slide--exit-left\s*\{\s*transition: none;/);
+  assert.match(html, /homeCarousel\.active === 2[\s\S]*?aria-hidden=\{homeCarousel\.active !== 2\}[\s\S]*?className="home-luxury-card"[\s\S]*?aria-label="Tarjeta motivadora de Al Toque IA"/);
+  assert.match(html, /homeCarousel\.exiting === 2 \? 'home-feature-slide--exit-left'/);
+  assert.equal((html.match(/className=\{`home-feature-slide /g) || []).length, 3,
+    'the carousel should contain the delivery, mood, and Al Toque AI slides');
+  assert.match(html, /Delivery de <span className="campus-service-highlight">COMIDA<\/span> para estudiantes del campus de\{' '\}\s*<img\s+src="\/miraflores-logo-transparent\.png\?v=3"\s+alt="Miraflores"\s+className="campus-service-location-logo"/);
+  assert.match(html, /\.campus-service-location-logo\s*\{[^}]*height: 2\.5em;[^}]*max-width: 42vw;/);
+  assert.match(html, /\.campus-service-location-logo\s*\{[^}]*filter: drop-shadow\(0 1px 0 #fff\)[^}]*animation: campusLocationLogoFloat/);
+  assert.match(html, /\.campus-service-location-logo\s*\{[^}]*animation: campusLocationLogoFloat 2\.8s ease-in-out infinite;/);
+  assert.match(html, /@keyframes campusLocationLogoFloat[\s\S]*?50% \{ transform: translateY\(-2px\) rotate\(1deg\); \}/);
+  assert.match(html, /@media \(prefers-reduced-motion: reduce\)\s*\{\s*\.campus-service-location-logo \{ animation: none; \}\s*\}/);
+  assert.match(html, /\.campus-service-highlight\s*\{[^}]*animation: campusServiceWordPulse 1\.8s ease-in-out infinite;/);
+  assert.match(html, /\.campus-service-highlight\s*\{[^}]*color: #fff;[^}]*text-shadow:/);
+  assert.match(html, /\.campus-service-highlight::before\s*\{[^}]*background: linear-gradient\(110deg, #f5bd3f, #ffe28a 48%, #f5bd3f\);[^}]*animation: campusServiceGoldHighlight 1\.8s ease-in-out infinite;/);
+  assert.match(html, /@keyframes campusServiceGoldHighlight[\s\S]*?45% \{ opacity: 1; transform: scaleX\(1\) rotate\(0\); \}/);
+  assert.doesNotMatch(html, /campusServiceQuotePop|content: "“"|content: "”"/);
+  assert.match(html, /@keyframes campusServiceWordPulse[\s\S]*?45% \{ transform: scale\(1\.09\); \}/);
+  assert.match(html, /10:00 a\. m\.–1:20 p\. m\. · 1:30–6:00 p\. m\. · 8:00–10:00 p\. m\./);
+  assert.match(html, /setServiceStatus\(getCampusServiceStatus\(now\)\)/);
+  assert.match(html, /aria-expanded=\{isServiceCardExpanded\}/);
+  assert.match(html, /aria-controls="campus-service-details"/);
+  assert.match(html, /data-lucide="chevron-down"/);
+  assert.match(html, /aria-hidden=\{!isServiceCardExpanded\}/);
+  assert.match(html, /className="campus-service-description"/);
+  assert.match(html, /\.campus-service-description\s*\{\s*font-family: 'Coiny', 'Fredoka', 'Outfit', sans-serif;\s*font-size: 16px;\s*font-weight: 400;[\s\S]*?color: #fff;[\s\S]*?-webkit-text-stroke: 0\.25px #fff;/);
+  assert.ok(html.indexOf("timeString || 'LUNES, 12:38 P. M.'") < html.indexOf('aria-label={`Servicio de delivery: ${serviceStatus.label}`}'),
+    'the date and time should appear above the campus service card');
+  assert.ok(html.indexOf('aria-label={`Servicio de delivery: ${serviceStatus.label}`}') < html.indexOf('>Lo más pedido</h3>'),
+    'the carousel should appear above the popular dishes section');
+  assert.ok(html.indexOf('className="home-headline-message') < html.indexOf('aria-label="Tarjeta motivadora de Al Toque IA"'),
+    'the mood message should appear before the Al Toque AI slide');
+  assert.ok(html.indexOf('aria-label="Tarjeta motivadora de Al Toque IA"') < html.indexOf('>Lo más pedido</h3>'),
+    'the Al Toque AI card should be the third carousel slide above the popular dishes');
+  assert.ok(html.indexOf('>Lo más pedido</h3>') < html.indexOf('>Combos que rinden</h3>'),
+    'the combos section should appear after popular dishes');
+  assert.match(html, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.campus-service-highlight::before,[\s\S]*?\.campus-service-highlight::after\s*\{\s*animation: none !important;\s*transition: none !important;/);
+});
+
+test('serves the four Starbucks Panettone product photos as public PNG assets', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const images = [
+    'starbucks-panettone-latte.png',
+    'starbucks-panettone-frappuccino.png',
+    'starbucks-panettone-latte-frio.png',
+    'starbucks-panettone-matcha-frio.png'
+  ];
+
+  for (const imageName of images) {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/${imageName}`);
+    const image = Buffer.from(await response.arrayBuffer());
+
+    assert.equal(response.status, 200, `${imageName} should be publicly available`);
+    assert.equal(response.headers.get('content-type'), 'image/png');
+    assert.equal(image.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+  }
+});
+
+test('serves the supplied Sugar Free Vanilla Protein Latte photo as a public PNG asset', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/starbucks-sugar-free-vanilla-protein-latte.png`);
+  const image = Buffer.from(await response.arrayBuffer());
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-type'), 'image/png');
+  assert.equal(image.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+});
+
+test('ends a connected voice call after ten minutes', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  let currentTime = 1_700_000_000_000;
+  const server = createAlToqueServer({
+    ordersFile: join(testDataDir, 'orders.json'),
+    reelsFile: join(testDataDir, 'reels.json'),
+    reelsVideosDir: join(testDataDir, 'reels-videos'),
+    now: () => currentTime
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(async () => {
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    await rm(testDataDir, { recursive: true, force: true });
+  });
+
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const callUrl = `${baseUrl}/api/orders/UPCH-CALL-TEST/call`;
+  const postCallAction = (role, action) => fetch(callUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({ role, action })
+  });
+
+  assert.equal((await postCallAction('customer', 'start')).status, 201);
+  assert.equal((await postCallAction('rider', 'accept')).status, 200);
+  currentTime += 10 * 60_000 - 1;
+  let response = await fetch(`${callUrl}?role=customer&after=0`);
+  assert.equal((await response.json()).call.status, 'connecting');
+
+  currentTime += 1;
+  response = await fetch(`${callUrl}?role=customer&after=0`);
+  const expiredCall = await response.json();
+  assert.equal(expiredCall.call.status, 'ended');
+  assert.equal(expiredCall.call.endReason, 'timeout');
+  assert.ok(expiredCall.signals.some((signal) => signal.type === 'timeout'));
+  assert.equal((await postCallAction('customer', 'hangup')).status, 409);
+});
+
+test('sends an opt-in confirmation through Gmail OAuth without exposing provider credentials', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const requestedCalls = [];
+  let gmailStatus = 200;
+  const server = createAlToqueServer({
+    ordersFile: join(testDataDir, 'orders.json'),
+    reelsFile: join(testDataDir, 'reels.json'),
+    reelsVideosDir: join(testDataDir, 'reels-videos'),
+    gmailClientId: 'test-client-id',
+    gmailClientSecret: 'test-client-secret',
+    gmailRefreshToken: 'test-refresh-token',
+    gmailUser: 'sender@gmail.com',
+    fetchImpl: async (url, options) => {
+      const requestUrl = new URL(url);
+      requestedCalls.push({ url: requestUrl, options });
+      if (requestUrl.hostname === 'oauth2.googleapis.com') {
+        return new Response(JSON.stringify({ access_token: 'test-access-token' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      const body = JSON.parse(options.body);
+      const mimeMessage = Buffer.from(body.raw, 'base64url').toString('utf8');
+      requestedCalls[requestedCalls.length - 1].body = body;
+      requestedCalls[requestedCalls.length - 1].mimeMessage = mimeMessage;
+      return new Response(JSON.stringify(gmailStatus === 200 ? { id: 'email-test-id' } : { error: { message: 'Provider error details' } }), {
+        status: gmailStatus,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(async () => {
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    await rm(testDataDir, { recursive: true, force: true });
+  });
+
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const subscribe = (origin, email) => fetch(`${baseUrl}/api/marketing/subscribe`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: origin },
+    body: JSON.stringify({ email })
+  });
+  const sentResponse = await subscribe(baseUrl, 'student@example.com');
+  assert.equal(sentResponse.status, 200);
+  assert.deepEqual(await sentResponse.json(), { sent: true });
+  assert.equal(requestedCalls[0].url.href, 'https://oauth2.googleapis.com/token');
+  assert.equal(requestedCalls[0].options.headers['Content-Type'], 'application/x-www-form-urlencoded');
+  assert.equal(new URLSearchParams(requestedCalls[0].options.body).get('refresh_token'), 'test-refresh-token');
+  assert.equal(requestedCalls[1].url.href, 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send');
+  assert.equal(requestedCalls[1].options.headers.Authorization, 'Bearer test-access-token');
+  assert.match(requestedCalls[1].mimeMessage, /From: Al Toque Pe <sender@gmail\.com>/);
+  assert.match(requestedCalls[1].mimeMessage, /To: student@example\.com/);
+  assert.match(requestedCalls[1].mimeMessage, /Subject: =\?UTF-8\?B\?/);
+  const textPart = requestedCalls[1].mimeMessage.match(/Content-Type: text\/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n([\s\S]*?)\r\n--/);
+  assert.ok(textPart);
+  assert.match(Buffer.from(textPart[1].replace(/\r\n/g, ''), 'base64').toString('utf8'), /Estás inscrito a Al Toque Pe/);
+  assert.match(requestedCalls[1].mimeMessage, /Content-Type: text\/html; charset=UTF-8/);
+
+  const invalidEmailResponse = await subscribe(baseUrl, 'not-an-email');
+  assert.equal(invalidEmailResponse.status, 400);
+  assert.equal(requestedCalls.length, 2);
+  const crossOriginResponse = await subscribe('https://malicious.example', 'student@example.com');
+  assert.equal(crossOriginResponse.status, 403);
+  assert.equal(requestedCalls.length, 2);
+
+  gmailStatus = 403;
+  const providerFailureResponse = await subscribe(baseUrl, 'another-student@example.com');
+  assert.equal(providerFailureResponse.status, 502);
+  assert.match((await providerFailureResponse.json()).error, /No se pudo enviar el correo/);
+});
+
+test('registers marketing consent in HubSpot and adds the contact to the workflow list', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const requestedCalls = [];
+  const server = createAlToqueServer({
+    ordersFile: join(testDataDir, 'orders.json'),
+    reelsFile: join(testDataDir, 'reels.json'),
+    reelsVideosDir: join(testDataDir, 'reels-videos'),
+    marketingProvider: 'hubspot',
+    hubspotAccessToken: 'test-hubspot-token',
+    hubspotListId: '9',
+    hubspotSubscriptionId: '123',
+    fetchImpl: async (url, options) => {
+      const requestUrl = new URL(url);
+      requestedCalls.push({ url: requestUrl, options });
+      const responseBody = requestUrl.pathname === '/crm/v3/objects/contacts'
+        ? { id: 'contact-123' }
+        : {};
+      return new Response(JSON.stringify(responseBody), {
+        status: requestUrl.pathname === '/crm/v3/objects/contacts' ? 201 : 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(async () => {
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    await rm(testDataDir, { recursive: true, force: true });
+  });
+
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const response = await fetch(`${baseUrl}/api/marketing/subscribe`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({ email: 'student@example.com' })
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { registered: true, provider: 'hubspot' });
+  assert.equal(requestedCalls.length, 3);
+  assert.equal(requestedCalls[0].url.href, 'https://api.hubapi.com/crm/v3/objects/contacts');
+  assert.equal(requestedCalls[0].options.headers.Authorization, 'Bearer test-hubspot-token');
+  assert.deepEqual(JSON.parse(requestedCalls[0].options.body), { properties: { email: 'student@example.com' } });
+  assert.equal(requestedCalls[1].url.href, 'https://api.hubapi.com/communication-preferences/v4/statuses/student%40example.com');
+  assert.equal(requestedCalls[1].options.method, 'POST');
+  assert.deepEqual(JSON.parse(requestedCalls[1].options.body), {
+    subscriptionId: 123,
+    statusState: 'SUBSCRIBED',
+    legalBasis: 'CONSENT_WITH_NOTICE',
+    legalBasisExplanation: 'The contact opted in through the Al Toque profile page.',
+    channel: 'EMAIL'
+  });
+  assert.equal(requestedCalls[2].url.href, 'https://api.hubapi.com/crm/v3/lists/9/memberships/add');
+  assert.deepEqual(JSON.parse(requestedCalls[2].options.body), ['contact-123']);
+});
+
+test('does not activate marketing opt-in when email delivery is not configured', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = createAlToqueServer({
+    ordersFile: join(testDataDir, 'orders.json'),
+    reelsFile: join(testDataDir, 'reels.json'),
+    reelsVideosDir: join(testDataDir, 'reels-videos'),
+    gmailClientId: '',
+    gmailClientSecret: '',
+    gmailRefreshToken: '',
+    gmailUser: ''
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(async () => {
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    await rm(testDataDir, { recursive: true, force: true });
+  });
+
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const response = await fetch(`${baseUrl}/api/marketing/subscribe`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({ email: 'student@example.com' })
+  });
+  assert.equal(response.status, 503);
+  assert.match((await response.json()).error, /no está configurado/i);
+});
+
+test('streams the order guide video with byte-range support', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const video = await readFile(new URL('./pedido-instrucciones.mp4', import.meta.url));
+  const response = await fetch(`${baseUrl}/pedido-instrucciones.mp4`, {
+    headers: { Range: 'bytes=0-31' }
+  });
+
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get('content-type'), 'video/mp4');
+  assert.equal(response.headers.get('accept-ranges'), 'bytes');
+  assert.equal(response.headers.get('content-range'), `bytes 0-31/${video.length}`);
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), video.subarray(0, 32));
+
+  const invalidRangeResponse = await fetch(`${baseUrl}/pedido-instrucciones.mp4`, {
+    headers: { Range: `bytes=${video.length}-` }
+  });
+  assert.equal(invalidRangeResponse.status, 416);
+  assert.equal(invalidRangeResponse.headers.get('content-range'), `bytes */${video.length}`);
+});
+
+test('serves the looping order received animation as a public video asset', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const video = await readFile(new URL('./pedido-recibido.mp4', import.meta.url));
+  const response = await fetch(`${baseUrl}/pedido-recibido.mp4`, {
+    headers: { Range: 'bytes=0-31' }
+  });
+
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get('content-type'), 'video/mp4');
+  assert.equal(response.headers.get('accept-ranges'), 'bytes');
+  assert.equal(response.headers.get('content-range'), `bytes 0-31/${video.length}`);
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), video.subarray(0, 32));
+});
+
+test('serves the bicycle order received animation as a public video asset', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const video = await readFile(new URL('./pedido-recibido-bicicleta.mp4', import.meta.url));
+  const response = await fetch(`${baseUrl}/pedido-recibido-bicicleta.mp4`, {
+    headers: { Range: 'bytes=0-31' }
+  });
+
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get('content-type'), 'video/mp4');
+  assert.equal(response.headers.get('accept-ranges'), 'bytes');
+  assert.equal(response.headers.get('content-range'), `bytes 0-31/${video.length}`);
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), video.subarray(0, 32));
+});
+
+test('serves the walking order received animation as a public video asset', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const video = await readFile(new URL('./pedido-recibido-caminando.mp4', import.meta.url));
+  const response = await fetch(`${baseUrl}/pedido-recibido-caminando.mp4`, {
+    headers: { Range: 'bytes=0-31' }
+  });
+
+  assert.equal(response.status, 206);
+  assert.equal(response.headers.get('content-type'), 'video/mp4');
+  assert.equal(response.headers.get('accept-ranges'), 'bytes');
+  assert.equal(response.headers.get('content-range'), `bytes 0-31/${video.length}`);
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), video.subarray(0, 32));
+});
+
+test('serves the transparent looping walking route character as an APNG image', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const response = await fetch(`${baseUrl}/caminante-ruta.png`);
+  const image = Buffer.from(await response.arrayBuffer());
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-type'), 'image/png');
+  assert.deepEqual(image.subarray(0, 8), Buffer.from('89504e470d0a1a0a', 'hex'));
+  const animationControlOffset = image.indexOf(Buffer.from('acTL'));
+  assert.ok(animationControlOffset > 0, 'the image should contain APNG animation control data');
+  assert.equal(image.readUInt32BE(animationControlOffset + 8), 0, 'the animation should loop forever');
+  assert.ok(image.length < 3_000_000, 'the preloaded character animation should stay compact');
+});
+
+test('preloads the order received animation when serving the application page', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/`);
+  const html = await response.text();
+
+  assert.equal(response.status, 200);
+  assert.match(html, /<link rel="preload" href="\/pedido-recibido\.mp4" as="video" type="video\/mp4"\s*\/?>/);
+  assert.match(html, /<link rel="preload" href="\/pedido-recibido-bicicleta\.mp4" as="video" type="video\/mp4"\s*\/?>/);
+  assert.match(html, /<link rel="preload" href="\/pedido-recibido-caminando\.mp4" as="video" type="video\/mp4"\s*\/?>/);
+  assert.match(html, /<link rel="preload" href="\/caminante-ruta\.png" as="image" type="image\/png"\s*\/?>/);
+});
+
+test('uses the single supplied splash emblem with the matching brand lettering', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const response = await fetch(baseUrl);
+  const html = await response.text();
+
+  assert.equal(response.status, 200);
+  assert.match(html, /\.brand-splash-mark\s*\{[^}]*width:\s*clamp\(112px,\s*30vw,\s*150px\);/);
+  assert.match(html, /\.splash-screen--brand \.brand-splash-mark\s*\{\s*width:\s*clamp\(72px,\s*20vw,\s*92px\);\s*height:\s*clamp\(72px,\s*20vw,\s*92px\);\s*\}/);
+  assert.match(html, /SPLASH_THEME_VARIANTS = \['brand', 'clean', 'warm', 'impact'\]/);
+  assert.match(html, /profile\.splashPreference \|\| 'brand'/);
+  assert.match(html, /const stickers = \[1, 2, 3, 4, 5, 6, 7, 8\]/);
+  assert.match(html, /\.splash-screen--brand \.splash-sticker\s*\{\s*width:\s*48px;\s*height:\s*48px;\s*\}/);
+  assert.match(html, /@keyframes splashSticker\s*\{\s*0%, 100% \{ transform: translateY\(0\) rotate\(-3deg\) scale\(0\.96\); \}\s*50% \{ transform: translateY\(-8px\) rotate\(3deg\) scale\(1\); \}\s*\}/);
+  assert.match(html, /\{ id: 'brand', label: 'Logo Al Toque'/);
+  assert.match(html, /<svg viewBox="0 0 100 100">[\s\S]*?fill="#f3b900" stroke="#633b24"[\s\S]*?stroke="#d52c32"/);
+  assert.match(html, /<div className="brand-splash-wordmark">al toque<\/div>/);
+  assert.match(html, /<span className="brand-splash-tagline">Tu antojo, al toque<\/span>/);
+  assert.match(html, /<span className="brand-splash-campus">UPCH CAMPUS<\/span>/);
+  assert.doesNotMatch(html, /splash-(?:clean|warm)-reference\.png/);
+});
+
+test('opens the cancellation policy in a phone-fitted in-app viewer', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const html = await (await fetch(baseUrl)).text();
+  assert.equal(html.split('onClick={() => setIsCancellationPolicyOpen(true)}').length - 1, 3);
+  assert.doesNotMatch(html, /href="\.\/politica-cancelacion-reembolso\.pdf"/);
+  assert.match(html, /id="root" class="[^"]*h-\[100vh\] sm:h-\[844px\][^"]*overflow-hidden[^"]*relative"/);
+  assert.match(html, /const renderCancellationPolicyDialog = \(\) => isCancellationPolicyOpen && ReactDOM\.createPortal\([\s\S]*?paddingTop:\s*'max\(12px, env\(safe-area-inset-top\)\)'[\s\S]*?paddingBottom:\s*'max\(12px, env\(safe-area-inset-bottom\)\)'/);
+  assert.match(html, /className="absolute inset-0 z-\[160\] flex items-center justify-center bg-black\/55"/);
+  assert.match(html, /h-full max-h-full min-h-0 w-full max-w-\[430px\] flex-1 flex-col overflow-hidden rounded-2xl/);
+  assert.match(html, /await import\('\/vendor\/pdf\.min\.mjs'\)/);
+  assert.match(html, /pdfjs\.GlobalWorkerOptions\.workerSrc = '\/vendor\/pdf\.worker\.min\.mjs'/);
+  assert.match(html, /url:\s*'\/politica-cancelacion-reembolso\.pdf'/);
+  assert.match(html, /Math\.min\(Math\.max\(window\.devicePixelRatio \|\| 1, 2\.5\), 3 \/ cancellationPolicyZoom\)/);
+  assert.match(html, /className="min-h-0 flex-1 overflow-auto overscroll-contain bg-gray-100 p-3"/);
+  assert.match(html, /addEventListener\('wheel', zoomWithWheel, \{ passive: false \}\)/);
+  assert.match(html, /aria-label="Alejar el documento"/);
+  assert.match(html, /aria-label="Acercar el documento"/);
+  assert.match(html, /setCancellationPolicyZoom\(1\)/);
+  assert.match(html, /style=\{\{ width: `\$\{cancellationPolicyZoom \* 100\}%` \}\}/);
+  assert.match(html, /setAttribute\('role', 'img'\)[\s\S]*?setAttribute\('aria-label', `Página \$\{pageNumber\} de \$\{pdfDocument\.numPages\}`\)/);
+  assert.match(html, /page\.render\(\{[\s\S]*?canvas,\s*canvasContext:\s*canvas\.getContext\('2d'\)/);
+  assert.doesNotMatch(html, /<iframe[^>]+politica-cancelacion-reembolso\.pdf/);
+  const cancelledOrderView = html.slice(html.indexOf("if (orderStatus === 'cancelled')"), html.indexOf("if (orderStatus === 'available')"));
+  assert.match(cancelledOrderView, /Volver al inicio\s*<\/button>[\s\S]*?onClick=\{\(\) => setIsCancellationPolicyOpen\(true\)\}[\s\S]*?Política de cancelación y reembolso/);
+  assert.match(cancelledOrderView, /renderCancellationPolicyDialog\(\)/);
+  const confirmedOrderViews = html.slice(html.indexOf('if (orderConfirmed)'), html.indexOf('\n      return (\n        <div className="space-y-4 pt-2">'));
+  assert.equal(confirmedOrderViews.match(/renderCancellationPolicyDialog\(\)/g)?.length, 5);
+
+  const response = await fetch(`${baseUrl}/politica-cancelacion-reembolso.pdf`);
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('content-type'), /application\/pdf/);
+  const pdf = Buffer.from(await response.arrayBuffer());
+  assert.equal(pdf.subarray(0, 5).toString('ascii'), '%PDF-');
+  for (const [asset, contentType] of [
+    ['/vendor/pdf.min.mjs', 'text/javascript; charset=utf-8'],
+    ['/vendor/pdf.worker.min.mjs', 'text/javascript; charset=utf-8'],
+    ['/vendor/pdfjs-standard-fonts/LiberationSans-Regular.ttf', 'application/octet-stream']
+  ]) {
+    const assetResponse = await fetch(`${baseUrl}${asset}`);
+    assert.equal(assetResponse.status, 200, `${asset} should load in the in-app PDF viewer`);
+    assert.equal(assetResponse.headers.get('content-type'), contentType);
+  }
+});
+
+test('collapses the open music player to a floating launcher while scrolling down', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/`);
+  const html = await response.text();
+
+  assert.equal(response.status, 200);
+  assert.match(html, /\.music-scroll-launcher\s*\{\s*position:\s*absolute;\s*right:\s*1rem;\s*bottom:\s*calc\(5\.5rem \+ env\(safe-area-inset-bottom\)\);\s*z-index:\s*30;\s*\}/);
+  assert.match(html, /@keyframes musicScrollLauncherEnter\s*\{\s*from \{ opacity: 0; transform: translateY\(8px\) scale\(0\.94\); \}\s*to \{ opacity: 1; transform: translateY\(0\) scale\(1\); \}\s*\}/);
+  assert.match(html, /transition-\[max-height,margin,opacity,transform\] duration-1000 ease-in-out \$\{isOpen && isVisible \? 'mb-3 max-h-\[700px\] translate-y-0 opacity-100' : 'mb-0 max-h-0 -translate-y-full border-transparent opacity-0 pointer-events-none'\}/);
+  assert.match(html, /const duration = 3000;[\s\S]*?const easedProgress = 1 - Math\.pow\(1 - progress, 3\);[\s\S]*?content\.scrollTop = startTop \* \(1 - easedProgress\);[\s\S]*?window\.requestAnimationFrame\(scrollToTop\)/);
+  assert.match(html, /prefers-reduced-motion: reduce[\s\S]*?content\.scrollTop = 0;/);
+  assert.match(html, /hidden=\{!isOnHome\}/);
+  assert.match(html, /aria-hidden=\{!isOnHome \|\| !isOpen \|\| \(isCompact && isHiddenOnScroll\)\}/);
+  assert.match(html, /activeTab === 'home' && isMusicPlayerOpen && isPlayerHiddenOnScroll[\s\S]*?setIsPlayerVisible\(true\);[\s\S]*?setIsPlayerHiddenOnScroll\(false\);[\s\S]*?const duration = 3000;[\s\S]*?window\.requestAnimationFrame\(scrollToTop\);[\s\S]*?aria-label="Volver al reproductor de música"/);
+  const scrollHandlerStart = html.indexOf('const handleContentScroll = () => {');
+  const scrollHandlerEnd = html.indexOf('\n        };', scrollHandlerStart);
+  const scrollHandler = html.slice(scrollHandlerStart, scrollHandlerEnd);
+  assert.match(scrollHandler, /if \(scrollingDown\) \{\s*setIsPlayerVisible\(false\);\s*setIsPlayerHiddenOnScroll\(true\);/);
+  assert.doesNotMatch(scrollHandler, /setIsPlayerVisible\(true\)|setIsPlayerHiddenOnScroll\(false\)/,
+    'scrolling up should leave the floating player launcher visible until it is tapped');
+});
+
+test('animates the home menu cards with a glowing outline and honors reduced motion', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/`);
+  const html = await response.text();
+  const touchStylesStart = html.indexOf('@media (hover: none) and (pointer: coarse)');
+  const touchStylesEnd = html.indexOf('@media (hover: hover) and (pointer: fine)', touchStylesStart);
+  const touchStyles = html.slice(touchStylesStart, touchStylesEnd);
+  const homeTouchStylesStart = html.indexOf('@media (hover: none) and (pointer: coarse)', touchStylesEnd);
+  const homeTouchStylesEnd = html.indexOf('@media (prefers-reduced-motion: reduce)', homeTouchStylesStart);
+  const homeTouchStyles = html.slice(homeTouchStylesStart, homeTouchStylesEnd);
+
+  assert.equal(response.status, 200);
+  assert.match(html, /\.home-menu-card\s*\{[^}]*animation:\s*homeMenuCardGlow 5\.8s ease-in-out infinite;/);
+  assert.match(html, /\.home-menu-card::after\s*\{[^}]*z-index:\s*0;[^}]*border:\s*1px solid rgba\(197, 164, 92, 0\.32\)/);
+  assert.match(html, /\.home-menu-card > \* \{\s*position: relative;\s*z-index: 1;\s*\}/);
+  assert.match(html, /\.home-menu-card-media\s*\{[^}]*margin:\s*0 12px 8px;[^}]*overflow:\s*visible;/);
+  assert.match(html, /\.home-menu-card \.combo-card-image\s*\{[^}]*animation:\s*homeMenuImageEnter 520ms ease-out both;/);
+  assert.match(html, /@keyframes homeMenuImageEnter\s*\{\s*from \{ opacity: 0\.7; \}\s*to \{ opacity: 1; \}\s*\}/);
+  assert.equal((html.match(/overflow-x-auto no-scrollbar py-6 -mx-4 px-8/g) || []).length, 2);
+  assert.match(html, /\.menu-pop-card\s*\{[^}]*margin-inline:\s*12px;/);
+  assert.match(html, /@media \(max-width: 480px\)\s*\{\s*\.menu-pop-card\s*\{\s*margin-inline:\s*24px;/);
+  assert.match(html, /\.combo-card:not\(\.home-menu-card\):hover \.combo-card-image/);
+  assert.match(html, /\.menu-popular-badge\s*\{[^}]*animation:\s*popularBadgeGlow 6\.8s ease-in-out infinite;/);
+  assert.match(html, /\.menu-popular-badge::after\s*\{[^}]*animation:\s*popularBadgeSheen 6\.8s ease-in-out infinite;/);
+  assert.match(html, /dish\.isPopular \? 'menu-popular-badge' : ''/);
+  assert.match(html, /@keyframes popularBadgeSheen\s*\{[\s\S]*?translateX\(390%\)/);
+  assert.match(html, /\.menu-popular-badge,\s*\.menu-popular-badge::after\s*\{\s*animation: none !important;/);
+  assert.match(html, /@media \(hover: hover\) and \(pointer: fine\)\s*\{\s*\.home-menu-card:has\(> \.home-menu-card-media:hover\)\s*\{[^}]*transform: translateY\(-3px\) scale\(1\.05\);/);
+  assert.match(html, /\.home-menu-card:has\(> \.home-menu-card-media:hover\) \.home-menu-card-media\s*\{\s*transform: translateY\(-8px\) scale\(1\.04\);/);
+  assert.match(html, /\.home-menu-card:has\(> \.home-menu-card-media:hover\) \.home-menu-card-image,\s*\.home-menu-card:has\(> \.home-menu-card-media:hover\) \.combo-card-image\s*\{\s*transform: translateY\(0\) scale\(1\.1\);/);
+  assert.ok(touchStylesStart >= 0 && touchStylesEnd > touchStylesStart, 'touch-specific pop-out styles should be present');
+  assert.ok(homeTouchStylesStart >= 0 && homeTouchStylesEnd > homeTouchStylesStart, 'touch-specific home card styles should be present');
+  assert.match(homeTouchStyles, /\.home-menu-card:has\(> \.home-menu-card-media:active\)\s*\{[^}]*transform: translateY\(-2px\) scale\(1\.015\);/);
+  assert.match(homeTouchStyles, /\.home-menu-card:has\(> \.home-menu-card-media:active\) \.home-menu-card-media\s*\{\s*transform: translateY\(-4px\) scale\(1\.01\);/);
+  assert.match(homeTouchStyles, /\.home-menu-card:has\(> \.home-menu-card-media:active\) \.home-menu-card-image,\s*\.home-menu-card:has\(> \.home-menu-card-media:active\) \.combo-card-image\s*\{\s*transform: translateY\(0\) scale\(1\.03\);/);
+  assert.ok(html.indexOf('.home-menu-card:hover .combo-card-image') > html.indexOf('.combo-card:hover .combo-card-image'),
+    'home card hover styles should override the generic combo hover effects');
+  assert.match(html, /className="home-menu-card min-w-\[220px\] bg-white/);
+  assert.match(html, /className="home-menu-card combo-card min-w-\[220px\] bg-white/);
+  assert.match(html, /\.menu-pop-card:not\(\.bembos-promo-card\):has\(> \.menu-pop-media:hover\)\s*\{[^}]*transform: translateY\(-3px\) scale\(1\.05\);/);
+  assert.match(html, /\.menu-pop-card:not\(\.bembos-promo-card\):has\(> \.menu-pop-media:hover\) \.menu-pop-image\s*\{[^}]*transform: scale\(1\.1\);/);
+  assert.match(html, /\.menu-pop-card:not\(\.bembos-promo-card\):has\(> \.menu-pop-media:hover\) \.menu-pop-promo-logo\s*\{\s*transform: scale\(1\.1\);\s*\}/);
+  assert.match(html, /\.bembos-promo-card:has\(> \.menu-pop-media:hover\) \.menu-pop-promo-logo\s*\{\s*transform: scale\(1\.08\);\s*\}/);
+  assert.match(html, /\.bembos-promo-card:has\(> \.menu-pop-media:active\) \.menu-pop-promo-logo\s*\{\s*transform: scale\(1\.035\);\s*\}/);
+  assert.match(html, /\.menu-pop-card:not\(\.bembos-promo-card\):has\(> \.menu-pop-media:active\) \.menu-pop-promo-logo\s*\{\s*transform: scale\(1\.03\);\s*\}/);
+  assert.match(html, /\.menu-pop-promo-logo\s*\{\s*z-index: 4;\s*transform-origin: center;\s*transition: transform 360ms ease;\s*\}/);
+  assert.match(html, /\.bembos-promo-media\s*\{[^}]*overflow:\s*visible;/);
+  assert.match(html, /\.bembos-promo-card:has\(> \.menu-pop-media:hover\)\s*\{\s*z-index:\s*4;/);
+  assert.match(html, /\.bembos-promo-card:has\(> \.menu-pop-media:hover\) \.bembos-promo-image\s*\{[^}]*transform: translateY\(-5px\) scale\(1\.08\);/);
+  assert.match(html, /\.bembos-promo-hover-label\s*\{[^}]*opacity:\s*0;/);
+  assert.match(html, /\.bembos-promo-card:has\(> \.menu-pop-media:hover\) \.bembos-promo-hover-label\s*\{\s*opacity:\s*1;/);
+  assert.match(html, /\.bembos-promo-card:has\(> \.menu-pop-media:active\) \.bembos-promo-image\s*\{[^}]*transform: translateY\(-3px\) scale\(1\.035\);/);
+  assert.match(html, /Bembos · promoción<\/span>/);
+  assert.match(html, /@media \(max-width: 480px\)\s*\{\s*\.menu-pop-card\s*\{\s*margin-inline:\s*24px;/);
+  assert.match(html, /\.menu-pop-card--compact\s*\{\s*margin-left: 0;\s*margin-right: 0;/);
+  assert.match(touchStyles, /\.menu-pop-card:not\(\.bembos-promo-card\):has\(> \.menu-pop-media:active\)\s*\{[^}]*transform: translateY\(-2px\) scale\(1\.015\);/);
+  assert.match(touchStyles, /\.menu-pop-card:not\(\.bembos-promo-card\):has\(> \.menu-pop-media:active\) \.menu-pop-media\s*\{\s*transform: translateY\(-4px\) scale\(1\.01\);/);
+  assert.match(touchStyles, /\.menu-pop-card:not\(\.bembos-promo-card\):has\(> \.menu-pop-media:active\) \.menu-pop-image\s*\{[^}]*transform: scale\(1\.03\);/);
+  assert.match(html, /\.bembos-promo-media\s*\{[^}]*aspect-ratio:\s*1\.15 \/ 1;[^}]*overflow:\s*visible;[^}]*border-radius:\s*1\.25rem;/);
+  assert.match(html, /\.bembos-promo-image\s*\{[^}]*object-fit:\s*cover;[^}]*object-position:\s*center;/);
+  assert.match(html, /className="menu-pop-media bembos-promo-media relative rounded-2xl bg-white"/);
+  assert.match(html, /className="menu-pop-image bembos-promo-image h-full w-full rounded-2xl"/);
+  assert.match(html, /className="menu-pop-card bembos-promo-card rounded-3xl border border-gray-100 bg-white p-3 shadow-sm"/);
+  assert.match(html, /className="menu-pop-card menu-pop-card--compact flex min-w-0 flex-col rounded-2xl border border-gray-200 bg-white p-2\.5 shadow-sm"/);
+  assert.match(html, /<div className="grid grid-cols-2 gap-6">/);
+  assert.match(html, /<div className="space-y-7">\s*\{promotions\.map/);
+  assert.match(html, /<div className="space-y-6">/);
+  assert.match(html, /className="menu-pop-promo-logo absolute bottom-1\.5 right-1\.5 rounded-full bg-white\/95 p-1 shadow-md"/);
+  assert.match(html, /className="menu-pop-card bg-white border border-gray-100 rounded-3xl p-3 shadow-sm space-y-2"/);
+  assert.match(html, /\.home-menu-card,\s*\.home-menu-card::after,\s*\.home-menu-card-media,\s*\.home-menu-card-image\s*\{\s*animation: none !important;\s*transition: none !important;/);
+});
+
+test('shows the Starbucks Panettone launch modal and upcoming items without prices', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/`);
+  const html = await response.text();
+  const promotionsStart = html.indexOf('const STARBUCKS_UPCOMING_PROMOTIONS = [');
+  const promotionsEnd = html.indexOf('\n    ];', promotionsStart);
+  const upcomingPromotions = html.slice(promotionsStart, promotionsEnd);
+  const productCardsStart = html.indexOf('aria-labelledby="starbucks-upcoming-title"');
+  const productCardsEnd = html.indexOf('{STARBUCKS_MENU_CATEGORIES.map', productCardsStart);
+  const productCards = html.slice(productCardsStart, productCardsEnd);
+  const touchStylesStart = html.indexOf('@media (hover: none) and (pointer: coarse)');
+  const touchStylesEnd = html.indexOf('@media (hover: hover) and (pointer: fine)', touchStylesStart);
+  const touchStyles = html.slice(touchStylesStart, touchStylesEnd);
+  const homeCardHoverStart = html.indexOf('.home-menu-card:has(> .home-menu-card-media:hover)');
+  const upcomingHoverStylesStart = html.lastIndexOf('@media (hover: hover) and (pointer: fine)', homeCardHoverStart);
+  const upcomingHoverStylesEnd = html.indexOf('@media (hover: none) and (pointer: coarse)', upcomingHoverStylesStart);
+  const upcomingHoverStyles = html.slice(upcomingHoverStylesStart, upcomingHoverStylesEnd);
+
+  assert.equal(response.status, 200);
+  assert.match(html, /const STARBUCKS_SECTIONS = \[\s*\{ id: 'panettone', label: 'Navidad 🎄' \},\s*\{ id: 'bebidas', label: 'Bebidas' \},\s*\{ id: 'alimentos', label: 'Alimentos' \},\s*\{ id: 'merch', label: 'Merch & Café en Grano' \},\s*\{ id: 'packs', label: 'Packs & Boxes' \}\s*\]/);
+  assert.match(html, /filter === 'starbucks' \? \(\s*<section className="space-y-5" aria-labelledby="starbucks-menu-title">\s*<h3 id="starbucks-menu-title" className="sr-only">Menú Starbucks<\/h3>\s*<div[^>]*role="tablist" aria-label="Categorías de Starbucks">/);
+  assert.match(html, /role="tab"\s*id=\{`starbucks-tab-\$\{section\.id\}`\}\s*aria-selected=\{starbucksSection === section\.id\}\s*aria-controls="starbucks-category-panel"\s*onClick=\{\(\) => setStarbucksSection\(section\.id\)\}/);
+  assert.match(html, /starbucksSection === 'panettone' \? \([\s\S]*?<h3 id="starbucks-upcoming-title"[^>]*>Navidad 🎄<\/h3>/);
+  assert.match(html, /border-\[#e30613\] text-\[#e30613\]/);
+  assert.match(html, /starbucksSection === 'bebidas' \? \(/);
+  assert.match(html, /Estamos preparando esta categoría de Starbucks\. Próximamente encontrarás aquí sus productos\./);
+  assert.match(html, /const STARBUCKS_CAMPAIGN_END_TIME = 1793854740000;/);
+  assert.match(html, /function formatStarbucksCountdown\(remainingMs\)/);
+  assert.match(html, /if \(!showStarbucksCampaign\) return undefined;\s*const countdownInterval = window\.setInterval\(\(\) => setCampaignClock\(Date\.now\(\)\), 1000\)/);
+  assert.match(html, /setFilter\('starbucks'\);\s*setStarbucksSection\('bebidas'\);\s*setCampaignClock\(Date\.now\(\)\);\s*setShowStarbucksCampaign\(true\);/);
+  assert.match(html, /role="dialog"\s*aria-modal="true"\s*aria-labelledby="starbucks-campaign-title"/);
+  assert.match(html, /\.starbucks-campaign-overlay\s*\{[^}]*box-sizing:\s*border-box;[^}]*margin:\s*0;[^}]*overflow-y:\s*auto;[^}]*padding:\s*calc\(env\(safe-area-inset-top,\s*0px\) \+ 24px\)\s+calc\(env\(safe-area-inset-right,\s*0px\) \+ 24px\)\s+calc\(env\(safe-area-inset-bottom,\s*0px\) \+ 24px\)\s+calc\(env\(safe-area-inset-left,\s*0px\) \+ 24px\);/);
+  assert.match(html, /\.space-y-4 > \.starbucks-campaign-overlay\s*\{\s*margin-top:\s*0 !important;\s*\}/);
+  assert.match(html, /\.starbucks-campaign-dialog\s*\{[^}]*box-sizing:\s*border-box;[^}]*width:\s*min\(100%,\s*680px\);[^}]*max-height:\s*100%;[^}]*overscroll-behavior:\s*contain;[^}]*margin:\s*auto;/);
+  assert.match(html, /className="starbucks-campaign-overlay absolute inset-0/);
+  assert.match(html, /id="root" class="[^"]*overflow-hidden[^"]*relative"/);
+  assert.match(html, /className="starbucks-campaign-dialog space-y-3/);
+  assert.match(html, /bebidas%20holidayst-1120x400%20%282%29\.png/);
+  assert.ok(promotionsStart >= 0 && promotionsEnd > promotionsStart, 'upcoming Starbucks promotions should be defined');
+  for (const product of [
+    'Panettone Latte',
+    'Panettone de Chocolate Frappuccino',
+    'Panettone Latte Frío',
+    'Matcha Latte Frío con Cold Foam de Panettone'
+  ]) {
+    assert.ok(upcomingPromotions.includes(product), `missing upcoming promotion: ${product}`);
+  }
+  for (const image of [
+    '/starbucks-panettone-latte.png',
+    '/starbucks-panettone-frappuccino.png',
+    '/starbucks-panettone-latte-frio.png',
+    '/starbucks-panettone-matcha-frio.png'
+  ]) {
+    assert.ok(upcomingPromotions.includes(image), `missing Panettone product image: ${image}`);
+  }
+  assert.match(productCards, /\{matchingUpcomingPromotions\.map\(\(product\) =>/);
+  assert.match(productCards, /className="menu-pop-card menu-pop-card--compact starbucks-upcoming-card flex min-w-0 flex-col overflow-visible rounded-2xl/);
+  assert.match(productCards, /className="starbucks-upcoming-media mx-auto my-2 flex aspect-square w-\[88%\] items-center justify-center rounded-full border-2 border-\[#d6bb79\] bg-\[#075344\] p-1\.5 shadow-md"/);
+  assert.match(productCards, /src=\{product\.image\}/);
+  assert.match(productCards, /className=\{`starbucks-upcoming-image \$\{product\.name === 'Panettone Latte' \? 'starbucks-upcoming-image--panettone-latte' : ''\}`\}/);
+  assert.match(html, /\.starbucks-upcoming-image\s*\{\s*display:\s*block;\s*width:\s*100%;\s*height:\s*100%;\s*border-radius:\s*50%;\s*object-fit:\s*cover;/);
+  assert.match(html, /\.starbucks-upcoming-image--panettone-latte\s*\{\s*width:\s*100%;\s*height:\s*100%;\s*\}/);
+  assert.match(productCards, /<h4 className="text-xs font-bold leading-snug text-dark">\{product\.name\}<\/h4>/);
+  assert.doesNotMatch(upcomingPromotions, /\bprice\s*:/, 'upcoming Starbucks products should not have prices');
+  assert.match(productCards, /Especial de temporada/);
+  assert.doesNotMatch(productCards, /onAddStarbucks|toFixed\(/, 'upcoming products should not be purchasable or display prices');
+  assert.match(html, /\.starbucks-upcoming-media\s*\{[^}]*transform-origin:\s*center;[^}]*transition:\s*transform 360ms/);
+  assert.match(upcomingHoverStyles, /\.starbucks-upcoming-card:has\(> \.starbucks-upcoming-media:hover\)/);
+  assert.match(html, /\.starbucks-upcoming-card:has\(> \.starbucks-upcoming-media:hover\) \.starbucks-upcoming-media\s*\{[^}]*transform: translateY\(-7px\) scale\(1\.08\);/);
+  assert.ok(touchStylesStart >= 0 && touchStylesEnd > touchStylesStart, 'touch-specific upcoming card styles should be present');
+  assert.match(touchStyles, /\.starbucks-upcoming-card:has\(> \.starbucks-upcoming-media:active\)/);
+  assert.match(touchStyles, /\.starbucks-upcoming-card:has\(> \.starbucks-upcoming-media:active\) \.starbucks-upcoming-media\s*\{[^}]*transform: translateY\(-5px\) scale\(1\.06\);/);
+  assert.match(html, /\.starbucks-upcoming-card,\s*\.starbucks-upcoming-media\s*\{\s*transition:\s*none !important;/);
+});
+
+test('shows the emoliente and cheese bread breakfast offer in Desayunos', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const response = await fetch(baseUrl);
+  const html = await response.text();
+  const imageResponse = await fetch(`${baseUrl}/desayuno-emoliente-pan-queso-nueva.png`);
+  const image = Buffer.from(await imageResponse.arrayBuffer());
+
+  assert.equal(response.status, 200);
+  assert.match(html, /id: '11',\s*name: 'Vaso de emoliente y Pan con Queso',\s*category: 'desayunos',\s*price: 5\.0,[\s\S]*?image: '\.\/desayuno-emoliente-pan-queso-nueva\.png'/);
+  assert.match(html, /filter === 'desayunos' && filteredItems\.length === 0 && !searchQuery\.trim\(\)[\s\S]*?Próximamente encontrarás aquí los desayunos\./);
+  assert.match(html, /className="menu-pop-card bg-white border border-gray-100 rounded-3xl p-3 shadow-sm space-y-2"/);
+  assert.equal(imageResponse.status, 200);
+  assert.equal(imageResponse.headers.get('content-type'), 'image/png');
+  assert.equal(image.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+});
+
+test('offers animated WhatsApp support for the Al Toque help phone number', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/`);
+  const html = await response.text();
+
+  assert.equal(response.status, 200);
+  assert.match(html, /href="https:\/\/wa\.me\/51967059396\?text=Hola%2C%20necesito%20ayuda%20con%20Al%20Toque\."/);
+  assert.match(html, /target="_blank"\s*rel="noopener noreferrer"/);
+  assert.match(html, /className="help-whatsapp-button flex w-full items-center justify-center gap-2 rounded-2xl p-3 text-sm font-bold text-white transition"/);
+  assert.match(html, /aria-label="Enviar mensaje por WhatsApp al 967 059 396"/);
+  assert.match(html, /\.help-whatsapp-button\s*\{[^}]*animation:\s*helpWhatsappPulse 1\.8s ease-in-out infinite;[^}]*background:\s*#128c4a;/);
+  assert.match(html, /@media \(prefers-reduced-motion: reduce\)\s*\{\s*\.help-whatsapp-button,[\s\S]*?\.complaint-book-page \{ animation: none !important; \}\s*\}/);
+});
+
+test('opens the Al Toque demo checkout from card and keeps transfers pending', async () => {
+  const [html, serverSource, applePayAsset, googlePayAsset, paypalAsset] = await Promise.all([
+    readFile(join(process.cwd(), 'Al-toque-pe-mejorado.html'), 'utf8'),
+    readFile(join(process.cwd(), 'server.mjs'), 'utf8'),
+    readFile(join(process.cwd(), 'apple-pay-demo.png')),
+    readFile(join(process.cwd(), 'google-pay-demo.png')),
+    readFile(join(process.cwd(), 'paypal-demo.png'))
+  ]);
+  const cartScreenStart = html.indexOf('function CartScreen(');
+  const checkoutStart = html.indexOf('aria-label="Opciones de pago de demostración"', cartScreenStart);
+  const checkoutEnd = html.indexOf('if (isRedirecting)', checkoutStart);
+  const checkout = html.slice(checkoutStart, checkoutEnd);
+
+  assert.ok(cartScreenStart >= 0 && checkoutStart > cartScreenStart && checkoutEnd > checkoutStart);
+  assert.match(html, /\.payment-globe-button\s*\{[^}]*isolation:\s*isolate;/);
+  assert.match(html, /\.payment-globe-button--cards \.payment-globe-art\s*\{[^}]*z-index:\s*20;[^}]*mix-blend-mode:\s*normal;/);
+  assert.match(html, /paymentMethod === 'tarjeta' && !isBembosDemoOnly[\s\S]*?setIsCardCheckoutOpen\(true\)/);
+  assert.match(checkout, /Visa · Mastercard · American Express/);
+  assert.match(checkout, /PayPal/);
+  assert.match(checkout, /onClick=\{\(\) => handleConfirmOrder\('paypal'\)\}/);
+  assert.match(checkout, /onClick=\{\(\) => handleConfirmOrder\('googlepay'\)\}/);
+  assert.match(checkout, /onClick=\{\(\) => handleConfirmOrder\('applepay'\)\}/);
+  assert.match(checkout, /src="\/apple-pay-demo\.png\?v=1"/);
+  assert.match(checkout, /src="\/google-pay-demo\.png\?v=1"/);
+  assert.match(checkout, /src="\/paypal-demo\.png\?v=1"/);
+  assert.match(checkout, /aspect-\[1\.875\][^"]*rounded-full/);
+  assert.match(checkout, /aspect-\[1\.6\][^"]*rounded-\[6px\]/);
+  assert.match(serverSource, /'apple-pay-demo\.png'/);
+  assert.match(serverSource, /'google-pay-demo\.png'/);
+  assert.match(serverSource, /'paypal-demo\.png'/);
+  assert.deepEqual([...applePayAsset.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+  assert.deepEqual([...googlePayAsset.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+  assert.deepEqual([...paypalAsset.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+  assert.match(checkout, /Google Pay/);
+  assert.match(checkout, /Apple Pay/);
+  assert.doesNotMatch(checkout, /PayPal, Google Pay y Apple Pay abren sus páginas oficiales/);
+  assert.match(checkout, /aria-label="Formulario de tarjeta de demostración"/);
+  assert.match(checkout, /Número de tarjeta \(demo\)/);
+  assert.match(checkout, /Vencimiento/);
+  assert.match(checkout, /CVC/);
+  assert.match(checkout, /Nombre del titular/);
+  assert.match(checkout, /Apellidos del titular/);
+  assert.match(checkout, /Código postal/);
+  assert.match(checkout, /Correo electrónico/);
+  assert.match(checkout, /Teléfono/);
+  assert.match(checkout, /Dirección de facturación/);
+  assert.match(html, /id: 'amex', label: 'AMEX'/);
+  assert.match(html, /id: 'carnet', label: 'CARNET'/);
+  assert.match(html, /id: 'diners', label: 'Diners Club'/);
+  assert.match(html, /function DemoCardBrandLogo\(\{ cardType \}\)/);
+  assert.match(html, /DINERS CLUB/);
+  assert.match(checkout, /role="group" aria-label="Tipo de tarjeta"/);
+  assert.match(checkout, /aria-pressed=\{demoCardBrand === cardType\.id\}/);
+  assert.match(checkout, /Vista previa ficticia de tarjeta \$\{demoCardType\.label\}/);
+  assert.match(checkout, /bg-gradient-to-br \$\{demoCardType\.gradient\}/);
+  assert.match(checkout, /detectedCardType = getDemoCardTypeFromNumber\(cardNumber\)/);
+  assert.match(html, /function getDemoCardTypeFromNumber\(cardNumber\)/);
+  assert.match(html, /digits\.startsWith\('4'\).*return 'visa'/);
+  assert.match(html, /firstTwo >= 51 && firstTwo <= 55/);
+  assert.match(html, /firstFour >= 2221 && firstFour <= 2720/);
+  assert.match(html, /30\[0-5\]\|36\|38\|39/);
+  assert.match(checkout, /aria-label="Resumen del pago"/);
+  assert.match(html, /const finishDemoCardForm = \(form, notice\) => \{\s*if \(!form \|\| !form\.reportValidity\(\)\) return;\s*form\.reset\(\);\s*closeDemoCardForm\(\);\s*setDemoCardFormNotice\(notice\);\s*\};/);
+  assert.match(html, /const handleDemoCardPayment = \(form\) => \{\s*if \(form\) form\.reset\(\);\s*closeDemoCardForm\(\);\s*setDemoCardFormNotice\(''\);\s*handleConfirmOrder\('transferencia'\);\s*\};/);
+  assert.match(checkout, /Guardar \(demo\)/);
+  assert.match(checkout, /Pagar \(demo\)/);
+  assert.match(checkout, /onClick=\{\(event\) => handleDemoCardPayment\(event\.currentTarget\.form\)\}/);
+  assert.match(checkout, /onClick=\{\(\) => handleConfirmOrder\('transferencia'\)\}/);
+  assert.match(checkout, /Continuar con el pedido · pago pendiente/);
+  assert.match(html, /url = 'https:\/\/www\.paypal\.com\/signin'/);
+  assert.match(html, /url = 'https:\/\/payments\.google\.com\/gp\/w\/u\/0\/home\/signup\?sctid=8843196690302193'/);
+  assert.match(html, /url = 'https:\/\/www\.apple\.com\/la\/apple-pay\/#setup'/);
+  assert.match(html, /const opensPaymentInNewTab = \['paypal', 'googlepay', 'applepay'\]\.includes\(selectedPaymentMethod\);\s*if \(opensPaymentInNewTab\) \{\s*window\.open\(url, '_blank', 'noopener,noreferrer'\);\s*\}/);
+  assert.match(html, /confirmedPaymentMethod === 'paypal' \? 'PayPal · Pendiente'/);
+  assert.match(html, /confirmedPaymentMethod === 'googlepay' \? 'Google Pay · Pendiente'/);
+  assert.match(html, /confirmedPaymentMethod === 'applepay' \? 'Apple Pay · Pendiente'/);
+  assert.match(html, /contentRef\.current\.scrollTop = 0/);
+  assert.match(html, /document\.body\.scrollTop = 0/);
+  assert.match(html, /document\.documentElement\.scrollTop = 0/);
+  assert.match(html, /window\.scrollTo\(0, 0\);\s+setIsCardCheckoutOpen\(true\)/);
+  assert.match(serverSource, /'transferencia'/);
+  assert.match(serverSource, /paymentStatus: 'pending'/);
+  assert.match(html, /order\.paymentStatus === 'pending'/);
+});
+
+test('normalizes React DOM values before order serialization', async () => {
+  const html = await readFile(join(process.cwd(), 'Al-toque-pe-mejorado.html'), 'utf8');
+  const textNormalizer = html.match(/function normalizeOrderText\(value, fieldName\) \{[\s\S]*?\n    \}/);
+  const imageNormalizer = html.match(/function normalizeOrderImage\(value\) \{[\s\S]*?\n    \}/);
+
+  assert.ok(textNormalizer);
+  assert.ok(imageNormalizer);
+  const normalizeOrderText = vm.runInNewContext(`(${textNormalizer[0]})`);
+  const normalizeOrderImage = vm.runInNewContext(`(${imageNormalizer[0]})`);
+  const fiber = {};
+  const span = { textContent: 'Yape', __reactFiber$: fiber };
+  fiber.stateNode = span;
+  const productImage = { src: 'https://example.test/product.png' };
+
+  assert.equal(normalizeOrderText(span, 'método de pago'), 'Yape');
+  assert.doesNotThrow(() => JSON.stringify({ paymentMethod: normalizeOrderText(span, 'método de pago') }));
+  assert.equal(normalizeOrderImage(productImage), productImage.src);
+  assert.equal(normalizeOrderImage(span), undefined);
+  assert.throws(() => normalizeOrderText({ value: 'Yape' }, 'método de pago'), /no contiene texto válido/);
+
+  const addToCartStart = html.indexOf('const addToCart =');
+  const orderStart = html.indexOf('const publishOrderToRiderQueue =');
+  const orderEnd = html.indexOf('const cancelOrder =', orderStart);
+  const orderSubmission = html.slice(orderStart, orderEnd);
+  assert.ok(addToCartStart >= 0 && orderStart > addToCartStart && orderEnd > orderStart);
+  assert.match(html.slice(addToCartStart, orderStart), /const itemName = normalizeOrderText\(item\.name/);
+  assert.match(orderSubmission, /name: normalizeOrderText\(item\.name/);
+  assert.match(orderSubmission, /pickupPoint: normalizeOrderText\(pickupPoint/);
+  assert.match(orderSubmission, /paymentMethod: normalizeOrderText\(selectedPaymentMethod/);
+});
+
+test('offers animated pickup-point choices at checkout and accepts them for customer orders', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const htmlResponse = await fetch(baseUrl);
+  const html = await htmlResponse.text();
+  const cartScreenStart = html.indexOf('function CartScreen(');
+  const pickupSectionStart = html.indexOf('aria-label="Elige un punto de recojo"', cartScreenStart);
+  const pickupSectionEnd = html.indexOf('Subtotal', pickupSectionStart);
+  const pickupSection = html.slice(pickupSectionStart, pickupSectionEnd);
+  const pickupPoints = ['En la puerta principal', 'En el patio', 'Área de tutoría'];
+
+  assert.equal(htmlResponse.status, 200);
+  assert.ok(cartScreenStart >= 0 && pickupSectionStart > cartScreenStart && pickupSectionEnd > pickupSectionStart);
+  assert.match(pickupSection, /\{ name: 'En la puerta principal', emoji: '🚪' \}/);
+  assert.match(pickupSection, /\{ name: 'En el patio', emoji: '🌿' \}/);
+  assert.match(pickupSection, /\{ name: 'Área de tutoría', emoji: '📚' \}/);
+  assert.match(pickupSection, /aria-pressed=\{pickupPoint === option\.name\}/);
+  assert.match(pickupSection, /onClick=\{\(\) => setPickupPoint\(option\.name\)\}/);
+  assert.match(html, /pickup-point-emoji[\s\S]*?animation: pickupPointEmojiBounce 1\.8s ease-in-out infinite;/);
+  assert.match(html, /@media \(prefers-reduced-motion: reduce\)\s*\{\s*\.pickup-point-emoji \{ animation: none; \}\s*\}/);
+  assert.doesNotMatch(html, /<select value=\{pickupPoint\}/);
+
+  for (const [index, pickupPoint] of pickupPoints.entries()) {
+    const response = await fetch(`${baseUrl}/api/orders`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+      body: JSON.stringify({
+        idempotencyKey: `pickup-test-${index}-${randomUUID()}`,
+        customer: 'Cliente',
+        items: [{ name: 'Lomo saltado', quantity: 1, price: 12 }],
+        pickupPoint,
+        paymentMethod: 'yape'
+      })
+    });
+    assert.equal(response.status, 201, `${pickupPoint} should be accepted for an order`);
+    assert.equal((await response.json()).order.pickupPoint, pickupPoint);
+  }
+
+  const transferResponse = await fetch(`${baseUrl}/api/orders`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({
+      idempotencyKey: `transfer-test-${randomUUID()}`,
+      customer: 'Cliente',
+      items: [{ name: 'Lomo saltado', quantity: 1, price: 12 }],
+      pickupPoint: 'En la puerta principal',
+      paymentMethod: 'transferencia'
+    })
+  });
+  assert.equal(transferResponse.status, 201);
+  const { order: transferOrder } = await transferResponse.json();
+  assert.equal(transferOrder.paymentMethod, 'transferencia');
+  assert.equal(transferOrder.paymentStatus, 'pending');
+
+  const paypalResponse = await fetch(`${baseUrl}/api/orders`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({
+      idempotencyKey: `paypal-test-${randomUUID()}`,
+      customer: 'Cliente',
+      items: [{ name: 'Lomo saltado', quantity: 1, price: 12 }],
+      pickupPoint: 'En la puerta principal',
+      paymentMethod: 'paypal'
+    })
+  });
+  assert.equal(paypalResponse.status, 201);
+  const { order: paypalOrder } = await paypalResponse.json();
+  assert.equal(paypalOrder.paymentMethod, 'paypal');
+  assert.equal(paypalOrder.paymentStatus, 'pending');
+
+  const googlePayResponse = await fetch(`${baseUrl}/api/orders`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({
+      idempotencyKey: `googlepay-test-${randomUUID()}`,
+      customer: 'Cliente',
+      items: [{ name: 'Lomo saltado', quantity: 1, price: 12 }],
+      pickupPoint: 'En la puerta principal',
+      paymentMethod: 'googlepay'
+    })
+  });
+  assert.equal(googlePayResponse.status, 201);
+  const { order: googlePayOrder } = await googlePayResponse.json();
+  assert.equal(googlePayOrder.paymentMethod, 'googlepay');
+  assert.equal(googlePayOrder.paymentStatus, 'pending');
+
+  const applePayResponse = await fetch(`${baseUrl}/api/orders`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({
+      idempotencyKey: `applepay-test-${randomUUID()}`,
+      customer: 'Cliente',
+      items: [{ name: 'Lomo saltado', quantity: 1, price: 12 }],
+      pickupPoint: 'En la puerta principal',
+      paymentMethod: 'applepay'
+    })
+  });
+  assert.equal(applePayResponse.status, 201);
+  const { order: applePayOrder } = await applePayResponse.json();
+  assert.equal(applePayOrder.paymentMethod, 'applepay');
+  assert.equal(applePayOrder.paymentStatus, 'pending');
+
+  const oldPickupPointResponse = await fetch(`${baseUrl}/api/orders`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({
+      customer: 'Cliente',
+      items: [{ name: 'Lomo saltado', quantity: 1, price: 12 }],
+      pickupPoint: 'Cafetería Central',
+      paymentMethod: 'yape'
+    })
+  });
+  assert.equal(oldPickupPointResponse.status, 400);
+});
+
+test('shows official Starbucks prices and starting-price labels', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/`);
+  const html = await response.text();
+  const sourceStart = html.indexOf('const STARBUCKS_PRODUCT_SOURCE = [');
+  const sourceEnd = html.indexOf('\n    ];', sourceStart);
+  const productSource = html.slice(sourceStart, sourceEnd);
+  const imageMapStart = html.indexOf('const STARBUCKS_PRODUCT_IMAGE_URLS = {');
+  const imageMapEnd = html.indexOf('\n    };', imageMapStart);
+  const imageMap = html.slice(imageMapStart, imageMapEnd);
+  const imageEntries = Array.from(imageMap.matchAll(/^\s+'([^']+)': '([^']+\.png)'[,]?$/gm));
+  const productNames = Array.from(productSource.matchAll(/\['[^']+', '([^']+)', [0-9.]+\]/g), (match) => match[1]);
+
+  assert.equal(response.status, 200);
+  assert.ok(imageMapStart >= 0 && imageMapEnd > imageMapStart, 'official Starbucks product image URLs should be defined');
+  assert.equal(imageEntries.length, productNames.length, 'every Starbucks catalog product should have an image URL');
+  assert.deepEqual(imageEntries.map((entry) => entry[1]).sort(), [...productNames].sort());
+  assert.match(html, /image: STARBUCKS_PRODUCT_IMAGE_URLS\[name\]/);
+  assert.match(imageMap, /'Sugar Free Vanilla Protein Latte': '\/starbucks-sugar-free-vanilla-protein-latte\.png'/);
+  assert.match(html, /className="menu-pop-media starbucks-product-media relative mx-auto mb-2 flex aspect-square w-\[88%\] items-center justify-center rounded-full border-2 border-\[#d6bb79\] bg-\[#075344\] p-2\.5 shadow-md"/);
+  assert.match(html, /\.starbucks-product-image\s*\{\s*display:\s*block;\s*width:\s*84%;\s*height:\s*84%;\s*border-radius:\s*50%;\s*object-fit:\s*contain;/);
+  assert.match(html, /\.starbucks-product-image--sugar-free-vanilla-protein-latte\s*\{\s*width:\s*64%;\s*height:\s*64%;\s*\}/);
+  assert.match(html, /product\.name === 'Sugar Free Vanilla Protein Latte' \? 'starbucks-product-image--sugar-free-vanilla-protein-latte'/);
+  assert.match(html, /alt=\{`Bebida de Starbucks: \$\{product\.name\}`\}/);
+  assert.doesNotMatch(html, /function createStarbucksProductImage/);
+  assert.match(productSource, /\['Bebidas Proteicas', 'Iced Protein Matcha', 22\]/);
+  assert.match(productSource, /\['Frappuccinos', 'Pumpkin Spice Frappuccino', 18\]/);
+  assert.match(productSource, /\['Refreshers', 'Strawberry Acaí Refresher', 14\.5\]/);
+  assert.match(productSource, /\['Shaken Espresso', 'Mocha Blanco Shaken Espresso Frío con Bebida de Avena', 17\.5\]/);
+  assert.match(html, /const STARBUCKS_FIXED_PRICE_PRODUCTS = new Set\(\[\s*'Aranciata Sanpellegrino',\s*'Peach and Clementine Sanpellegrino Zero',\s*'Limonata Sanpellegrino'\s*\]\)/);
+  assert.match(html, /price,\s*pricePrefix: STARBUCKS_FIXED_PRICE_PRODUCTS\.has\(name\) \? 'S\/' : 'Desde S\/'/);
+  assert.match(html, /\{product\.pricePrefix\}\{product\.price\.toFixed\(2\)\}/);
+  assert.doesNotMatch(html, /STARBUCKS_DISCOUNTED_PRODUCTS/);
+});
+
+test('shows official Starbucks food items with prices, circular photos and interactive cards', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/`);
+  const html = await response.text();
+  const sourceStart = html.indexOf('const STARBUCKS_FOOD_SOURCE = [');
+  const sourceEnd = html.indexOf('\n    ];', sourceStart);
+  const productSource = html.slice(sourceStart, sourceEnd);
+  const imageMapStart = html.indexOf('const STARBUCKS_FOOD_IMAGE_URLS = {');
+  const imageMapEnd = html.indexOf('\n    };', imageMapStart);
+  const imageMap = html.slice(imageMapStart, imageMapEnd);
+  const products = Array.from(productSource.matchAll(/\['([^']+)', '([^']+)', ([0-9.]+)\]/g), (match) => ({
+    category: match[1],
+    name: match[2],
+    price: Number(match[3])
+  }));
+  const imageEntries = Array.from(imageMap.matchAll(/^\s+'([^']+)': '(https:\/\/[^']+\.png)'[,]?$/gm));
+  const foodPanelStart = html.indexOf("starbucksSection === 'alimentos' ?");
+  const foodPanelEnd = html.indexOf('Estamos preparando esta categoría de Starbucks.', foodPanelStart);
+  const foodPanel = html.slice(foodPanelStart, foodPanelEnd);
+
+  assert.equal(response.status, 200);
+  assert.ok(sourceStart >= 0 && sourceEnd > sourceStart, 'official Starbucks food items should be defined');
+  assert.equal(products.length, 28);
+  assert.deepEqual(
+    products.reduce((counts, product) => ({ ...counts, [product.category]: (counts[product.category] || 0) + 1 }), {}),
+    { Pastries: 9, Postres: 7, 'Sándwiches': 12 }
+  );
+  assert.equal(imageEntries.length, products.length, 'every Starbucks food product should have an official image');
+  assert.deepEqual(imageEntries.map((entry) => entry[1]).sort(), products.map((product) => product.name).sort());
+  assert.ok(imageEntries.every((entry) => entry[2].startsWith('https://stb-content-pe-prd-bucket.s3.us-east-1.amazonaws.com/images/products/')));
+  assert.match(html, /STARBUCKS_PRODUCTS\.length \+ STARBUCKS_FOOD_PRODUCTS\.length \+ STARBUCKS_MERCH_PRODUCTS\.length \+ STARBUCKS_PACK_PRODUCTS\.length \+ STARBUCKS_UPCOMING_PROMOTIONS\.length/);
+  assert.ok(products.some((product) => product.name === 'Galleta Rellena de Crema de Avellanas' && product.price === 11));
+  assert.ok(products.some((product) => product.name === 'Cheesecake de Arándanos' && product.price === 16));
+  assert.ok(products.some((product) => product.name === 'Sándwich Chicken Ciabatta' && product.price === 14.5));
+  assert.match(html, /const STARBUCKS_FOOD_CATEGORIES = \['Pastries', 'Postres', 'Sándwiches'\]/);
+  assert.match(html, /const STARBUCKS_FOOD_PRODUCTS = STARBUCKS_FOOD_SOURCE\.map\(\(\[menuCategory, name, price\], index\) => \(\{\s*id: `starbucks-food-\$\{index \+ 1\}`,\s*name,\s*category: 'alimentos'/);
+  assert.match(foodPanel, /STARBUCKS_FOOD_CATEGORIES\.map\(\(category\) =>/);
+  assert.match(foodPanel, /className="menu-pop-media starbucks-product-media relative mx-auto mb-2 flex aspect-square w-\[88%\] items-center justify-center rounded-full border-2 border-\[#d6bb79\]/);
+  assert.match(foodPanel, /alt=\{`Alimento de Starbucks: \$\{product\.name\}`\}/);
+  assert.match(foodPanel, /onClick=\{\(\) => onAddStarbucks\(product\)\}/);
+  assert.match(html, /\.menu-pop-card:not\(\.bembos-promo-card\):has\(> \.menu-pop-media:hover\) \.menu-pop-image\s*\{\s*z-index:\s*3;\s*transform:\s*scale\(1\.1\);/);
+  assert.match(html, /\.menu-pop-card:not\(\.bembos-promo-card\):has\(> \.menu-pop-media:active\) \.menu-pop-image\s*\{\s*z-index:\s*3;\s*transform:\s*scale\(1\.03\);/);
+});
+
+test('shows Starbucks coffee and merch with official prices, photos and add-to-order buttons', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/`);
+  const html = await response.text();
+  const sourceStart = html.indexOf('const STARBUCKS_MERCH_SOURCE = [');
+  const sourceEnd = html.indexOf('\n    ];', sourceStart);
+  const productSource = html.slice(sourceStart, sourceEnd);
+  const imageMapStart = html.indexOf('const STARBUCKS_MERCH_IMAGE_URLS = {');
+  const imageMapEnd = html.indexOf('\n    };', imageMapStart);
+  const imageMap = html.slice(imageMapStart, imageMapEnd);
+  const products = Array.from(productSource.matchAll(/\['([^']+)', '([^']+)', ([0-9.]+)\]/g), (match) => ({
+    category: match[1],
+    name: match[2],
+    price: Number(match[3])
+  }));
+  const imageEntries = Array.from(imageMap.matchAll(/^\s+'([^']+)': '(https:\/\/[^']+\.png)'[,]?$/gm));
+  const merchPanelStart = html.indexOf("starbucksSection === 'merch' ?");
+  const merchPanelEnd = html.indexOf('Estamos preparando esta categoría de Starbucks.', merchPanelStart);
+  const merchPanel = html.slice(merchPanelStart, merchPanelEnd);
+
+  assert.equal(response.status, 200);
+  assert.ok(sourceStart >= 0 && sourceEnd > sourceStart, 'Starbucks coffee and merch products should be defined');
+  assert.deepEqual(products, [
+    { category: 'Café en Grano', name: 'Espresso 250 gr.', price: 40 },
+    { category: 'Café en Grano', name: 'Verona 250 gr.', price: 40 },
+    { category: 'Café en Grano', name: 'Sumatra 250 gr.', price: 40 },
+    { category: 'Café en Grano', name: 'Colombia 250 gr.', price: 40 },
+    { category: 'Merch', name: 'Bearista Bear Llama', price: 45 }
+  ]);
+  assert.equal(imageEntries.length, products.length, 'every Starbucks merch product should have an official image');
+  assert.deepEqual(imageEntries.map((entry) => entry[1]).sort(), products.map((product) => product.name).sort());
+  assert.ok(imageEntries.every((entry) => entry[2].startsWith('https://stb-content-pe-prd-bucket.s3.us-east-1.amazonaws.com/images/products/')));
+  assert.match(html, /const STARBUCKS_MERCH_CATEGORIES = \['Café en Grano', 'Merch'\]/);
+  assert.match(html, /const STARBUCKS_MERCH_PRODUCTS = STARBUCKS_MERCH_SOURCE\.map\(\(\[menuCategory, name, price\], index\) => \(\{\s*id: `starbucks-merch-\$\{index \+ 1\}`,\s*name,\s*category: 'merch'/);
+  assert.match(merchPanel, /STARBUCKS_MERCH_CATEGORIES\.map\(\(category\) =>/);
+  assert.match(merchPanel, /alt=\{`Producto Starbucks: \$\{product\.name\}`\}/);
+  assert.match(merchPanel, /onClick=\{\(\) => onAddStarbucks\(product\)\}/);
+});
+
+test('shows Starbucks packs with official prices, photos and starting-price labels', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/`);
+  const html = await response.text();
+  const sourceStart = html.indexOf('const STARBUCKS_PACK_SOURCE = [');
+  const sourceEnd = html.indexOf('\n    ];', sourceStart);
+  const productSource = html.slice(sourceStart, sourceEnd);
+  const imageMapStart = html.indexOf('const STARBUCKS_PACK_IMAGE_URLS = {');
+  const imageMapEnd = html.indexOf('\n    };', imageMapStart);
+  const imageMap = html.slice(imageMapStart, imageMapEnd);
+  const products = Array.from(productSource.matchAll(/\['([^']+)', '([^']+)', ([0-9.]+), (true|false)\]/g), (match) => ({
+    category: match[1],
+    name: match[2],
+    price: Number(match[3]),
+    priceVaries: match[4] === 'true'
+  }));
+  const imageEntries = Array.from(imageMap.matchAll(/^\s+'([^']+)': '(https:\/\/[^']+\.png)'[,]?$/gm));
+  const packsPanelStart = html.indexOf("starbucksSection === 'packs' ?");
+  const packsPanelEnd = html.indexOf('Estamos preparando esta categoría de Starbucks.', packsPanelStart);
+  const packsPanel = html.slice(packsPanelStart, packsPanelEnd);
+
+  assert.equal(response.status, 200);
+  assert.ok(sourceStart >= 0 && sourceEnd > sourceStart, 'Starbucks packs should be defined');
+  assert.deepEqual(products, [
+    { category: 'Dosis de Proteína', name: 'Dúo Proteico', price: 25, priceVaries: true },
+    { category: 'Coffee for Share', name: 'Coffee Traveler', price: 60, priceVaries: false },
+    { category: 'Coffee for Share', name: 'Pack Coffee Mixto', price: 121, priceVaries: false },
+    { category: 'Coffee for Share', name: 'Pack Coffee Sándwich', price: 136, priceVaries: false },
+    { category: 'Coffee for Share', name: 'Pack Coffee Galleta', price: 96, priceVaries: false },
+    { category: 'Desayunos', name: 'Desayuno Para 2', price: 31, priceVaries: true },
+    { category: 'Desayunos', name: 'Desayuno Ligero', price: 15, priceVaries: true },
+    { category: 'Desayunos', name: 'Dúo Desayuno winter', price: 12, priceVaries: true },
+    { category: 'Antojos de la tarde', name: 'Momentos Dulces', price: 15, priceVaries: true },
+    { category: 'Antojos de la tarde', name: 'Tardes con Starbucks', price: 13, priceVaries: true },
+    { category: 'Antojos de la tarde', name: 'Dúo tardes winter', price: 12, priceVaries: true }
+  ]);
+  assert.equal(imageEntries.length, products.length, 'every Starbucks pack should have an official image');
+  assert.deepEqual(imageEntries.map((entry) => entry[1]).sort(), products.map((product) => product.name).sort());
+  assert.ok(imageEntries.every((entry) => entry[2].startsWith('https://stb-content-pe-prd-bucket.s3.us-east-1.amazonaws.com/images/products/')));
+  assert.match(html, /const STARBUCKS_PACK_CATEGORIES = \['Dosis de Proteína', 'Coffee for Share', 'Desayunos', 'Antojos de la tarde'\]/);
+  assert.match(html, /pricePrefix: priceVaries \? 'Desde S\/' : 'S\/'/);
+  assert.match(packsPanel, /STARBUCKS_PACK_CATEGORIES\.map\(\(category\) =>/);
+  assert.match(packsPanel, /alt=\{`Pack Starbucks: \$\{product\.name\}`\}/);
+  assert.match(packsPanel, /onClick=\{\(\) => onAddStarbucks\(product\)\}/);
+});
+
+test('animates the walking rider from the first blue point through the route to the destination', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/`);
+  const html = await response.text();
+
+  assert.equal(response.status, 200);
+  assert.match(html, /const DELIVERY_DURATION_MS = 300000;/);
+  const routeMatch = html.match(/const WALKING_ROUTE_POINTS = \[([\s\S]*?)\];/);
+  assert.ok(routeMatch, 'walking route waypoints should be defined');
+  const routePoints = Array.from(routeMatch[1].matchAll(/\{ x: (\d+), y: (\d+) \}/g), (match) => ({
+    x: Number(match[1]),
+    y: Number(match[2])
+  }));
+  assert.deepEqual(routePoints[0], { x: 58, y: 72 }, 'the character should start at the first blue point near KOU-XIN');
+  assert.deepEqual(routePoints.at(-1), { x: 44, y: 3 }, 'the character should finish at the destination end of the blue route');
+  assert.ok(routePoints.length >= 18, 'the character should follow the visible route waypoints');
+  assert.ok(routePoints.slice(1, 6).every((point, index) => (
+    point.x < routePoints[index].x && point.y < routePoints[index].y
+  )), 'the character should follow the first diagonal section of blue route points');
+  assert.deepEqual(routePoints[6], { x: 38, y: 56 }, 'the character should pass through the visible route bend');
+  assert.ok(routePoints.slice(7, 13).every((point, index) => (
+    point.x > routePoints[index + 6].x && point.y < routePoints[index + 6].y
+  )), 'the character should follow the blue route back up and to the right');
+  assert.ok(routePoints.slice(13).every((point, index) => point.x < routePoints[index + 12].x && point.y < routePoints[index + 12].y),
+    'the last route section should continue toward the destination marker');
+  assert.match(html, /function getWalkingRoutePosition\(progress, routePoints = WALKING_ROUTE_POINTS\)/);
+  assert.match(html, /function getWalkingGpsPosition\(location, routeOrigin, routeDestination, mapWidth, mapHeight\)/);
+  const gpsPositionStart = html.indexOf('function getWalkingGpsPosition(');
+  const gpsPositionEnd = html.indexOf('class LiveRouteMapErrorBoundary', gpsPositionStart);
+  assert.ok(gpsPositionStart >= 0 && gpsPositionEnd > gpsPositionStart, 'GPS position projection should be defined');
+  const gpsPositionSource = html.slice(gpsPositionStart, gpsPositionEnd).trim();
+  const getWalkingGpsPosition = vm.runInNewContext(`(${gpsPositionSource})`);
+  const originPosition = getWalkingGpsPosition(
+    { latitude: -12.1348222, longitude: -77.0260012 },
+    [-12.1348222, -77.0260012],
+    [-12.1341675, -77.0260721],
+    400,
+    300
+  );
+  const destinationPosition = getWalkingGpsPosition(
+    { latitude: -12.1341675, longitude: -77.0260721 },
+    [-12.1348222, -77.0260012],
+    [-12.1341675, -77.0260721],
+    400,
+    300
+  );
+  assert.ok(originPosition.y > destinationPosition.y, 'GPS projection should move north as the rider approaches the destination');
+  assert.match(html, /if \(isGpsLocationActive\) return undefined;/);
+  assert.match(html, /getWalkingGpsPosition\(\s*gpsLocation,\s*mapOrigin,\s*DELIVERY_ROUTE_END,\s*bounds\.width,\s*bounds\.height\s*\)/);
+  assert.match(html, /style=\{\{ left: `\$\{walkingRoutePoints\[0\]\.x\}%`, top: `\$\{walkingRoutePoints\[0\]\.y\}%` \}\}/);
+  assert.match(html, /walkingStartedAt=\{deliveryPhase === 'tracking' && assignedRider\?\.vehicle === 'Caminando'\s*\? deliveryStartedAtRef\.current\s*: null\}/);
+  assert.match(html, /walking-route-character/);
+  assert.match(html, /window\.requestAnimationFrame\(updatePosition\)/);
+  assert.match(html, /window\.cancelAnimationFrame\(animationFrame\)/);
+  assert.doesNotMatch(html, /setInterval\(updateProgress,\s*1000\)/);
+  assert.match(html, /\.walking-route-locked\s+\.live-route-map-frame\s*\{\s*pointer-events:\s*none;/);
+  assert.match(html, /isMapInteractionLocked\s*\?\s*' walking-route-locked'/);
+  assert.match(html, /tabIndex=\{isMapInteractionLocked \? -1 : undefined\}/);
+  assert.match(html, /Ruta fija a pie · 5 min/);
+  assert.match(html, /allowMapInteraction \? 'Ruta a pie · 5 min' : 'Ruta fija a pie · 5 min'/);
+  assert.match(html, /function LiveRouteMap\(\{\s*location,\s*className,\s*label,\s*walkingStartedAt = null,\s*allowMapInteraction = false,\s*walkingRoutePoints = WALKING_ROUTE_POINTS,\s*gpsLocation = null\s*\}\)/);
+  assert.match(html, /walkingStartedAt=\{step === 1 && riderDetails\.vehicle === 'Caminando'\s*\?\s*activeOrder\?\.routeStartedAt \|\| activeOrder\?\.pickedUpAt\s*:\s*null\}/);
+  assert.match(html, /label=\{`Ruta en vivo del pedido \$\{activeOrder\?\.id \|\| ''\}`\}\s*walkingStartedAt=\{step === 1 && riderDetails\.vehicle === 'Caminando'/);
+  assert.match(html, /\.delivery-map \.walking-route-character\s*\{\s*width:\s*clamp\(56px, 16%, 70px\)/);
+  assert.match(html, /\.rider-map \.walking-route-character\s*\{\s*width:\s*clamp\(56px, 16%, 70px\)/);
+  assert.match(html, /\.rider-map \.walking-route-character\s*\{[^}]*transition:\s*left \.7s linear, top \.7s linear/);
+  assert.match(html, /\.walking-route-character\s*\{[\s\S]*?width:\s*clamp\(34px, 12%, 48px\)/);
+  assert.match(html, /walkingStartedAt=\{step === 1 && riderDetails\.vehicle === 'Caminando'[\s\S]{0,240}?allowMapInteraction\s*walkingRoutePoints=\{RIDER_WALKING_ROUTE_POINTS\}/);
+  assert.match(html, /gpsLocation=\{riderDetails\.vehicle === 'Caminando' && gps\.status === 'active' \? gps : null\}/);
+  assert.match(html, /function getWalkingRoutePosition\(progress, routePoints = WALKING_ROUTE_POINTS\)/);
+  assert.match(html, /Date\.now\(\) - walkingStartedAt\) \/ DELIVERY_DURATION_MS/);
+  assert.match(html, /isWalkingAnimationActive\s*\?\s*allowMapInteraction \? 'Ruta a pie · 5 min' : 'Ruta fija a pie · 5 min'/);
+});
+
+test('shows the matching order received animation for each assigned rider transport', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/`);
+  const html = await response.text();
+
+  assert.equal(response.status, 200);
+  assert.match(html, /const shouldShowArrivalVideo = isArrivalVisible && \['Moto', 'Bicicleta', 'Caminando'\]\.includes\(assignedRider\?\.vehicle\);/);
+  assert.match(html, /const arrivalVideoSrc = assignedRider\?\.vehicle === 'Bicicleta'\s+\? '\/pedido-recibido-bicicleta\.mp4'\s+: assignedRider\?\.vehicle === 'Caminando'\s+\? '\/pedido-recibido-caminando\.mp4'\s+: '\/pedido-recibido\.mp4';/);
+  assert.match(html, /\{shouldShowArrivalVideo && \(\s*<video\s+ref=\{arrivalVideoRef\}\s+src=\{arrivalVideoSrc\}/);
+  assert.match(html, /if \(!shouldShowArrivalVideo \|\| !video\) return undefined;/);
+});
+
+test('keeps customer order tracking visible as soon as the rider confirms pickup', async (t) => {
+  const html = await readFile(new URL('./Al-toque-pe-mejorado.html', import.meta.url), 'utf8');
+
+  assert.match(html, /orderStatus === 'delivered' \|\| deliveryPhase === 'arrived'\s*\?\s*renderArrival\(\)/);
+  assert.match(html, /orderStatus === 'picked_up' \|\| deliveryPhase === 'tracking'\s*\?\s*<>\{renderDeliveryTracking\(\)\}\{renderRiderProfileCard\(\)\}<\/>\s*:\s*\(/);
+});
+
+test('unlocks VIP Gorritos at twenty points or twenty purchases and keeps the level for existing members', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/`);
+  const html = await response.text();
+
+  assert.equal(response.status, 200);
+  assert.match(html, /gorritosVip: savedProfile\.gorritosVip === true\s*\|\|\s*\(Number\.isInteger\(savedProfile\.gorritos\) && savedProfile\.gorritos >= 20\)\s*\|\|\s*\(Number\.isInteger\(savedProfile\.gorritosPurchaseCount\) && savedProfile\.gorritosPurchaseCount >= 20\)/);
+  assert.match(html, /const isGorritosVip = profile\.gorritosVip === true \|\| points >= 20 \|\| purchaseCount >= 20;/);
+  assert.match(html, /const alreadyVip = current\.gorritosVip === true \|\| currentPoints >= 20 \|\| completedPurchases >= 20;/);
+  assert.match(html, /gorritosVip: alreadyVip \|\| nextBalance >= 20 \|\| nextPurchaseCount >= 20/);
+  assert.match(html, /Alcanza 20 Gorritos o completa 20 compras participantes para desbloquearlo\./);
+});
+
+test('shares only public rider profile fields with customers and persists updates', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const driverId = 'rider-profile-sync-test';
+  const profileUrl = `${baseUrl}/api/rider/profile?driverId=${encodeURIComponent(driverId)}`;
+  const updateResponse = await fetch(profileUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({
+      driverId,
+      name: 'Armando actualizado',
+      vehicle: 'Bicicleta',
+      photo: 'data:image/jpeg;base64,dGVzdA==',
+      dni: '12345678',
+      identityPhoto: 'private-document'
+    })
+  });
+
+  assert.equal(updateResponse.status, 200);
+  const { profile: updatedProfile } = await updateResponse.json();
+  assert.equal(updatedProfile.name, 'Armando actualizado');
+  assert.equal(updatedProfile.vehicle, 'Bicicleta');
+  assert.equal(updatedProfile.photo, 'data:image/jpeg;base64,dGVzdA==');
+  assert.equal(Object.hasOwn(updatedProfile, 'dni'), false);
+  assert.equal(Object.hasOwn(updatedProfile, 'identityPhoto'), false);
+
+  const customerResponse = await fetch(profileUrl, { cache: 'no-store' });
+  const { profile: customerProfile } = await customerResponse.json();
+  assert.equal(customerProfile.name, 'Armando actualizado');
+  assert.equal(customerProfile.vehicle, 'Bicicleta');
+  assert.equal(customerProfile.photo, 'data:image/jpeg;base64,dGVzdA==');
+  assert.equal(customerProfile.hasPublicProfile, true);
+  const savedState = JSON.parse(await readFile(join(testDataDir, 'rider-profiles.json'), 'utf8'));
+  assert.equal(savedState.profiles[0].name, 'Armando actualizado');
+
+  await new Promise((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+  });
+  const restartedServer = await createReelsTestServer(t, testDataDir);
+  const restartedBaseUrl = `http://127.0.0.1:${restartedServer.address().port}`;
+  const restartedProfileUrl = `${restartedBaseUrl}/api/rider/profile?driverId=${encodeURIComponent(driverId)}`;
+  const restartedCustomerResponse = await fetch(restartedProfileUrl, { cache: 'no-store' });
+  const { profile: restartedCustomerProfile } = await restartedCustomerResponse.json();
+  assert.equal(restartedCustomerProfile.name, 'Armando actualizado');
+  assert.equal(restartedCustomerProfile.vehicle, 'Bicicleta');
+  assert.equal(restartedCustomerProfile.photo, 'data:image/jpeg;base64,dGVzdA==');
+
+  const crossOriginResponse = await fetch(restartedProfileUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: 'https://malicious.example' },
+    body: JSON.stringify({ driverId, name: 'Otro nombre', vehicle: '', photo: null })
+  });
+  assert.equal(crossOriginResponse.status, 403);
+
+  const invalidPhotoResponse = await fetch(restartedProfileUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: restartedBaseUrl },
+    body: JSON.stringify({ driverId, name: 'Armando', vehicle: 'Moto', photo: 'data:image/png;base64,AA==' })
+  });
+  assert.equal(invalidPhotoResponse.status, 400);
+});
+
+test('serves the offline JavaScript and font assets from local paths', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const assets = [
+    ['/vendor/tailwind.js', 'text/javascript; charset=utf-8'],
+    ['/vendor/react.development.js', 'text/javascript; charset=utf-8'],
+    ['/vendor/react-dom.development.js', 'text/javascript; charset=utf-8'],
+    ['/vendor/babel.min.js', 'text/javascript; charset=utf-8'],
+    ['/vendor/lucide.js', 'text/javascript; charset=utf-8'],
+    ['/vendor/pdf.min.mjs', 'text/javascript; charset=utf-8'],
+    ['/vendor/pdf.worker.min.mjs', 'text/javascript; charset=utf-8'],
+    ['/vendor/fonts.css', 'text/css; charset=utf-8'],
+    ['/vendor/fonts/outfit-400.ttf', 'font/ttf'],
+    ['/vendor/fonts/outfit-500.ttf', 'font/ttf'],
+    ['/vendor/fonts/outfit-600.ttf', 'font/ttf'],
+    ['/vendor/fonts/outfit-700.ttf', 'font/ttf'],
+    ['/vendor/fonts/space-grotesk-600.ttf', 'font/ttf'],
+    ['/vendor/fonts/space-grotesk-700.ttf', 'font/ttf'],
+    ['/vendor/fonts/fredoka-700.ttf', 'font/ttf'],
+    ['/vendor/fonts/coiny-400.ttf', 'font/ttf']
+  ];
+
+  for (const [path, contentType] of assets) {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}${path}`);
+    assert.equal(response.status, 200, `${path} should be served`);
+    assert.equal(response.headers.get('content-type'), contentType);
+    assert.ok(Number(response.headers.get('content-length')) > 0, `${path} should not be empty`);
+  }
+
+  const fontStylesResponse = await fetch(`http://127.0.0.1:${server.address().port}/vendor/fonts.css`);
+  const fontStyles = await fontStylesResponse.text();
+  assert.match(fontStyles, /font-family: 'Fredoka';[^}]*font-weight: 700;[^}]*fredoka-700\.ttf/);
+  assert.match(fontStyles, /font-family: 'Coiny';[^}]*font-weight: 400;[^}]*coiny-400\.ttf\?v=2/);
+});
+
+test('compresses large text assets when the client accepts gzip', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const response = await new Promise((resolve, reject) => {
+    const request = http.get(`http://127.0.0.1:${server.address().port}/vendor/babel.min.js`, {
+      headers: { 'accept-encoding': 'gzip' }
+    }, resolve);
+    request.once('error', reject);
+  });
+  const chunks = [];
+  for await (const chunk of response) chunks.push(chunk);
+  const compressed = Buffer.concat(chunks);
+  const original = gunzipSync(compressed);
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.headers['content-encoding'], 'gzip');
+  assert.equal(response.headers.vary, 'Accept-Encoding');
+  assert.equal(response.headers['content-type'], 'text/javascript; charset=utf-8');
+  assert.ok(compressed.length < original.length);
+  assert.equal(Number(response.headers['content-length']), compressed.length);
+});
+
+test('serves the professor photo used in the October promotion window', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/promo-profesor-martin.png`);
+  const cleanedResponse = await fetch(`http://127.0.0.1:${server.address().port}/promo-profesor-martin-limpio.png`);
+  const referenceResponse = await fetch(`http://127.0.0.1:${server.address().port}/promo-profesor-martin-referencia.png`);
+  const bannerResponse = await fetch(`http://127.0.0.1:${server.address().port}/promo-al-toque-banner.png`);
+  const image = Buffer.from(await response.arrayBuffer());
+  const cleanedImage = Buffer.from(await cleanedResponse.arrayBuffer());
+  const referenceImage = Buffer.from(await referenceResponse.arrayBuffer());
+  const bannerImage = Buffer.from(await bannerResponse.arrayBuffer());
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-type'), 'image/png');
+  assert.equal(image.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+  assert.equal(cleanedResponse.status, 200);
+  assert.equal(cleanedResponse.headers.get('content-type'), 'image/png');
+  assert.equal(cleanedImage.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+  assert.notDeepEqual(cleanedImage, image);
+  assert.equal(referenceResponse.status, 200);
+  assert.equal(referenceResponse.headers.get('content-type'), 'image/png');
+  assert.equal(referenceImage.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+  assert.equal(bannerResponse.status, 200);
+  assert.equal(bannerResponse.headers.get('content-type'), 'image/png');
+  assert.equal(bannerImage.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+});
+
+test('creates and updates standalone Reels profiles with validated public IDs and photos', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const profileId = randomUUID();
+  const photo = `data:image/png;base64,${Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).toString('base64')}`;
+
+  const createResponse = await fetch(`${baseUrl}/api/reels/profile`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profileId, name: '  Reels creator  ', photo })
+  });
+  assert.equal(createResponse.status, 201);
+  assert.deepEqual((await createResponse.json()).profile, { profileId, name: 'Reels creator', photo });
+
+  const updateResponse = await fetch(`${baseUrl}/api/reels/profile`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profileId, name: 'Creator updated' })
+  });
+  assert.equal(updateResponse.status, 200);
+  assert.deepEqual((await updateResponse.json()).profile, { profileId, name: 'Creator updated', photo });
+
+  const invalidIdResponse = await fetch(`${baseUrl}/api/reels/profile`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profileId: '../bad', name: 'Invalid' })
+  });
+  assert.equal(invalidIdResponse.status, 400);
+  const invalidPhotoResponse = await fetch(`${baseUrl}/api/reels/profile`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profileId: randomUUID(), name: 'Invalid photo', photo: 'data:image/png;base64,Zm9v' })
+  });
+  assert.equal(invalidPhotoResponse.status, 400);
+  const oversizedImage = Buffer.alloc(1024 * 1024 + 1);
+  Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(oversizedImage);
+  const oversizedPhotoResponse = await fetch(`${baseUrl}/api/reels/profile`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      profileId: randomUUID(),
+      name: 'Oversized photo',
+      photo: `data:image/png;base64,${oversizedImage.toString('base64')}`
+    })
+  });
+  assert.equal(oversizedPhotoResponse.status, 400);
+});
+
+test('accepts requests from localhost aliases when using the same local server port', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const port = server.address().port;
+  const response = await fetch(`http://127.0.0.1:${port}/api/reels/profile`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Origin: `http://localhost:${port}`
+    },
+    body: JSON.stringify({ profileId: randomUUID(), name: 'Alias ok' })
+  });
+  assert.equal(response.status, 201);
+});
+
+test('shares orders from 100 browser customer profiles with the same rider queue', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const customerProfileIds = [];
+
+  for (let index = 0; index < 100; index += 1) {
+    const customerProfileId = randomUUID();
+    customerProfileIds.push(customerProfileId);
+    const response = await fetch(`${baseUrl}/api/orders`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+      body: JSON.stringify({
+        idempotencyKey: `customer-profile-${index}-${randomUUID()}`,
+        customerProfileId,
+        customer: `Cliente ${index + 1}`,
+        items: [{ name: 'Lomo saltado', quantity: 1, price: 12 }],
+        pickupPoint: 'En la puerta principal',
+        paymentMethod: 'yape'
+      })
+    });
+    assert.equal(response.status, 201);
+    assert.equal((await response.json()).order.customerProfileId, customerProfileId);
+  }
+
+  const riderQueueResponse = await fetch(`${baseUrl}/api/orders`);
+  assert.equal(riderQueueResponse.status, 200);
+  const { orders } = await riderQueueResponse.json();
+  assert.equal(orders.length, 100);
+  assert.deepEqual(new Set(orders.map((order) => order.customerProfileId)), new Set(customerProfileIds));
+
+  const invalidProfileResponse = await fetch(`${baseUrl}/api/orders`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({
+      customerProfileId: 'not-a-uuid',
+      items: [{ name: 'Lomo saltado', quantity: 1, price: 12 }],
+      pickupPoint: 'En la puerta principal',
+      paymentMethod: 'yape'
+    })
+  });
+  assert.equal(invalidProfileResponse.status, 400);
+});
+
+test('keeps the existing browser profile and migrates customer data into its profile storage', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/`);
+  const html = await response.text();
+
+  assert.equal(response.status, 200);
+  assert.match(html, /const CUSTOMER_PROFILE_ID_KEY = 'altoque_customer_profile_id';/);
+  assert.match(html, /function getCustomerProfileId\(\)[\s\S]*?localStorage\.setItem\(CUSTOMER_PROFILE_ID_KEY, profileId\)/);
+  assert.match(html, /function getCustomerStorageKey\(key, profileId = getCustomerProfileId\(\)\)[\s\S]*?localStorage\.setItem\(scopedKey, savedValue\);[\s\S]*?localStorage\.removeItem\(key\)/);
+  assert.match(html, /getCustomerStorageKey\('altoque_profile', customerProfileId\)/);
+  assert.match(html, /getCustomerStorageKey\('altoque_order_history', customerProfileId\)/);
+  assert.match(html, /customerProfileId,\s*customer: profile\.nickname/);
+  assert.match(html, /JSON\.parse\(localStorage\.getItem\('altoque_rider_demo'\) \|\| 'null'\)/);
+});
+
+test('shares customer orders with riders when HTTPS terminates at the reverse proxy', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const postThroughProxy = (origin, body) => new Promise((resolve, reject) => {
+    const request = http.request(`${baseUrl}/api/orders`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(JSON.stringify(body)),
+        Host: 'app.altoque.test',
+        Origin: origin,
+        'X-Forwarded-Proto': 'https'
+      }
+    }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => resolve({
+        status: response.statusCode,
+        body: JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      }));
+    });
+    request.once('error', reject);
+    request.end(JSON.stringify(body));
+  });
+  const orderResponse = await postThroughProxy('https://app.altoque.test', {
+    idempotencyKey: 'proxy-order-123456',
+    customer: 'Cliente',
+    items: [{ name: 'Lomo saltado', quantity: 1, price: 12 }],
+    pickupPoint: 'En la puerta principal',
+    paymentMethod: 'yape'
+  });
+
+  assert.equal(orderResponse.status, 201);
+  const { order } = orderResponse.body;
+  assert.equal(order.status, 'available');
+
+  const riderQueueResponse = await fetch(`${baseUrl}/api/orders`);
+  assert.equal(riderQueueResponse.status, 200);
+  assert.deepEqual((await riderQueueResponse.json()).orders.map(({ id }) => id), [order.id]);
+
+  const rejectedResponse = await postThroughProxy('https://attacker.example', {
+    idempotencyKey: 'proxy-order-654321',
+    customer: 'Origen ajeno',
+    items: [{ name: 'Lomo saltado', quantity: 1, price: 12 }],
+    pickupPoint: 'En la puerta principal',
+    paymentMethod: 'yape'
+  });
+  assert.equal(rejectedResponse.status, 403);
+});
+
+test('loads the public feed for a valid first-time viewer before profile creation', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const newViewerId = randomUUID();
+
+  const response = await fetch(`${baseUrl}/api/reels?profileId=${newViewerId}`);
+  assert.equal(response.status, 200);
+  const feed = await response.json();
+  assert.deepEqual(feed, { posts: [], profiles: [] });
+
+  const invalidResponse = await fetch(`${baseUrl}/api/reels?profileId=not-a-uuid`);
+  assert.equal(invalidResponse.status, 400);
+});
+
+test('uploads validated video streams and serves them with byte-range support', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const mp4 = Buffer.from('000000186674797069736f6d00000000', 'hex');
+  const upload = (contentType, body) => fetch(`${baseUrl}/api/reels/videos`, {
+    method: 'POST',
+    headers: { 'Content-Type': contentType },
+    body
+  });
+
+  const unsupportedResponse = await upload('video/quicktime', mp4);
+  assert.equal(unsupportedResponse.status, 400);
+  const mismatchedResponse = await upload('video/webm', mp4);
+  assert.equal(mismatchedResponse.status, 400);
+  const invalidSignatureResponse = await upload('video/mp4', Buffer.from('not a video'));
+  assert.equal(invalidSignatureResponse.status, 400);
+
+  const uploadResponse = await upload('video/mp4', mp4);
+  assert.equal(uploadResponse.status, 201);
+  const { video } = await uploadResponse.json();
+  assert.match(video.id, /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  assert.equal(video.url, `/api/reels/videos/${video.id}`);
+  assert.equal(video.mimeType, 'video/mp4');
+
+  const rangeResponse = await fetch(`${baseUrl}${video.url}`, { headers: { Range: 'bytes=4-11' } });
+  assert.equal(rangeResponse.status, 206);
+  assert.equal(rangeResponse.headers.get('content-type'), 'video/mp4');
+  assert.equal(rangeResponse.headers.get('accept-ranges'), 'bytes');
+  assert.equal(rangeResponse.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(rangeResponse.headers.get('content-range'), `bytes 4-11/${mp4.length}`);
+  assert.deepEqual(Buffer.from(await rangeResponse.arrayBuffer()), mp4.subarray(4, 12));
+  assert.equal((await fetch(`${baseUrl}/api/reels/videos/%2e%2e%2fserver.mjs`)).status, 404);
+  assert.equal((await fetch(`${baseUrl}/api/reels/videos/${randomUUID()}`)).status, 404);
+});
+
+test('requires and persists image-rights consent when a Reel includes people', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const profileId = randomUUID();
+  const jsonPost = (path, value) => fetch(`${baseUrl}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(value)
+  });
+
+  await jsonPost('/api/reels/profile', { profileId, name: 'Creator' });
+  const uploadResponse = await fetch(`${baseUrl}/api/reels/videos`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x93, 0x42])
+  });
+  assert.equal(uploadResponse.status, 201);
+  const { video } = await uploadResponse.json();
+
+  const missingConsentResponse = await jsonPost('/api/reels/posts', {
+    profileId,
+    videoId: video.id,
+    caption: 'Person visible',
+    hasPeople: true,
+    imageRightsAccepted: false
+  });
+  assert.equal(missingConsentResponse.status, 400);
+
+  const acceptedResponse = await jsonPost('/api/reels/posts', {
+    profileId,
+    videoId: video.id,
+    caption: 'Person visible',
+    hasPeople: true,
+    imageRightsAccepted: true
+  });
+  assert.equal(acceptedResponse.status, 201);
+  const { post } = await acceptedResponse.json();
+  const savedReels = JSON.parse(await readFile(join(testDataDir, 'reels.json'), 'utf8'));
+  const savedPost = savedReels.posts.find((item) => item.id === post.id);
+  assert.equal(savedPost.hasPeople, true);
+  assert.ok(Number.isFinite(new Date(savedPost.imageRightsAcceptedAt).getTime()));
+});
+
+test('shares Reels posts, likes and comments across profiles and server restarts', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  let server = await createReelsTestServer(t, testDataDir);
+  const firstBaseUrl = `http://127.0.0.1:${server.address().port}`;
+  const creatorId = randomUUID();
+  const viewerId = randomUUID();
+  const jsonPost = (path, value, baseUrl = firstBaseUrl) => fetch(`${baseUrl}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(value)
+  });
+  await jsonPost('/api/reels/profile', { profileId: creatorId, name: 'Creator' });
+  await jsonPost('/api/reels/profile', { profileId: viewerId, name: 'Viewer' });
+
+  const uploadResponse = await fetch(`${firstBaseUrl}/api/reels/videos`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x93, 0x42])
+  });
+  assert.equal(uploadResponse.status, 201);
+  const { video } = await uploadResponse.json();
+  assert.equal(video.mimeType, 'video/webm');
+
+  const createPostResponse = await jsonPost('/api/reels/posts', {
+    profileId: creatorId,
+    videoId: video.id,
+    caption: 'First reel'
+  });
+  assert.equal(createPostResponse.status, 201);
+  const { post } = await createPostResponse.json();
+  assert.equal(post.profileName, 'Creator');
+  assert.equal(post.likeCount, 0);
+  assert.equal(post.likedByViewer, false);
+  assert.equal(post.comments.length, 0);
+
+  const firstLikeResponse = await jsonPost(`/api/reels/posts/${post.id}/like`, { profileId: viewerId });
+  assert.equal((await firstLikeResponse.json()).post.likeCount, 1);
+  const duplicateLikeResponse = await jsonPost(`/api/reels/posts/${post.id}/like`, { profileId: viewerId });
+  assert.equal((await duplicateLikeResponse.json()).post.likeCount, 0);
+  await jsonPost(`/api/reels/posts/${post.id}/like`, { profileId: creatorId });
+
+  const commentResponse = await jsonPost(`/api/reels/posts/${post.id}/comments`, { profileId: viewerId, text: 'Nice video!' });
+  assert.equal(commentResponse.status, 201);
+  assert.equal((await commentResponse.json()).comment.profileName, 'Viewer');
+
+  const feedResponse = await fetch(`${firstBaseUrl}/api/reels?profileId=${viewerId}`);
+  assert.equal(feedResponse.status, 200);
+  const feed = await feedResponse.json();
+  assert.equal(feed.posts[0].id, post.id);
+  assert.equal(feed.posts[0].likeCount, 1);
+  assert.equal(feed.posts[0].likedByViewer, false);
+  assert.deepEqual(feed.posts[0].comments.map(({ profileId, profileName, text }) => ({ profileId, profileName, text })), [
+    { profileId: viewerId, profileName: 'Viewer', text: 'Nice video!' }
+  ]);
+  assert.equal(feed.profiles.length, 2);
+
+  await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  server = await createReelsTestServer(t, testDataDir);
+  const restartedUrl = `http://127.0.0.1:${server.address().port}`;
+  const restartedFeed = await fetch(`${restartedUrl}/api/reels?profileId=${creatorId}`);
+  assert.equal(restartedFeed.status, 200);
+  const persisted = await restartedFeed.json();
+  assert.equal(persisted.posts[0].likeCount, 1);
+  assert.equal(persisted.posts[0].likedByViewer, true);
+  assert.equal(persisted.posts[0].comments[0].text, 'Nice video!');
+  assert.equal((await fetch(`${restartedUrl}${video.url}`, { headers: { Range: 'bytes=0-3' } })).status, 206);
+});
+
+test('requires the deletion password and owner profile to remove a Reel', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const creatorId = randomUUID();
+  const viewerId = randomUUID();
+
+  await fetch(`${baseUrl}/api/reels/profile`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profileId: creatorId, name: 'Owner' })
+  });
+  await fetch(`${baseUrl}/api/reels/profile`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profileId: viewerId, name: 'Viewer' })
+  });
+
+  const uploadResponse = await fetch(`${baseUrl}/api/reels/videos`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x93, 0x42])
+  });
+  assert.equal(uploadResponse.status, 201);
+  const { video } = await uploadResponse.json();
+
+  const createPostResponse = await fetch(`${baseUrl}/api/reels/posts`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profileId: creatorId, videoId: video.id, caption: 'Delete me' })
+  });
+  assert.equal(createPostResponse.status, 201);
+  const { post } = await createPostResponse.json();
+
+  const forbiddenDeleteResponse = await fetch(`${baseUrl}/api/reels/posts/${post.id}`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profileId: viewerId })
+  });
+  assert.equal(forbiddenDeleteResponse.status, 403);
+
+  const missingPasswordResponse = await fetch(`${baseUrl}/api/reels/posts/${post.id}`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profileId: creatorId })
+  });
+  assert.equal(missingPasswordResponse.status, 403);
+
+  const incorrectPasswordResponse = await fetch(`${baseUrl}/api/reels/posts/${post.id}`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profileId: creatorId, password: '0000' })
+  });
+  assert.equal(incorrectPasswordResponse.status, 403);
+
+  const deleteResponse = await fetch(`${baseUrl}/api/reels/posts/${post.id}`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profileId: creatorId, password: 'test-reels-delete-password' })
+  });
+  assert.equal(deleteResponse.status, 200);
+  assert.deepEqual(await deleteResponse.json(), { deleted: true, postId: post.id });
+
+  const feedResponse = await fetch(`${baseUrl}/api/reels?profileId=${creatorId}`);
+  assert.equal(feedResponse.status, 200);
+  const feed = await feedResponse.json();
+  assert.deepEqual(feed.posts, []);
+  assert.equal((await fetch(`${baseUrl}${video.url}`)).status, 404);
+});
+
+test('disables Reel deletion when the server password is not configured', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir, '');
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const profileId = randomUUID();
+
+  await fetch(`${baseUrl}/api/reels/profile`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profileId, name: 'Owner' })
+  });
+  const uploadResponse = await fetch(`${baseUrl}/api/reels/videos`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x93, 0x42])
+  });
+  assert.equal(uploadResponse.status, 201);
+  const { video } = await uploadResponse.json();
+  const createPostResponse = await fetch(`${baseUrl}/api/reels/posts`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profileId, videoId: video.id, caption: 'Delete me' })
+  });
+  assert.equal(createPostResponse.status, 201);
+  const { post } = await createPostResponse.json();
+
+  const deleteResponse = await fetch(`${baseUrl}/api/reels/posts/${post.id}`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profileId, password: '' })
+  });
+  assert.equal(deleteResponse.status, 503);
+  assert.equal((await deleteResponse.json()).error, 'La eliminación de Reels no está configurada en el servidor.');
+});
+
+test('rejects oversized Reels video requests before accepting their bodies', async (t) => {
+  const testDataDir = await createReelsTestDirectory();
+  const server = await createReelsTestServer(t, testDataDir);
+  const address = server.address();
+  const status = await new Promise((resolve, reject) => {
+    const request = http.request({
+      host: '127.0.0.1',
+      port: address.port,
+      path: '/api/reels/videos',
+      method: 'POST',
+      headers: { 'Content-Type': 'video/mp4', 'Content-Length': 100 * 1024 * 1024 + 1 }
+    }, (response) => {
+      response.resume();
+      response.once('end', () => {
+        request.destroy();
+        resolve(response.statusCode);
+      });
+    });
+    request.on('error', (error) => {
+      if (!request.destroyed) reject(error);
+    });
+    request.flushHeaders();
+  });
+  assert.equal(status, 413);
+});
+
+test('serves the public Gorritos sticker and sticker pack', async (t) => {
+  const testDataDir = await mkdtemp(join(tmpdir(), 'altoque-audio-test-'));
+  const server = createAlToqueServer({ ordersFile: join(testDataDir, 'orders.json') });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(async () => {
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    await rm(testDataDir, { recursive: true, force: true });
+  });
+
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  const gorritosWelcomeStickerResponse = await fetch(`${baseUrl}/gorritos-welcome-hat.png`);
+  assert.equal(gorritosWelcomeStickerResponse.status, 200);
+  assert.equal(gorritosWelcomeStickerResponse.headers.get('content-type'), 'image/png');
+  assert.deepEqual(
+    Array.from(new Uint8Array(await gorritosWelcomeStickerResponse.arrayBuffer()).slice(0, 8)),
+    [137, 80, 78, 71, 13, 10, 26, 10]
+  );
+
+  for (let stickerId = 1; stickerId <= 25; stickerId += 1) {
+    const stickerExtension = stickerId <= 8 ? 'webp' : 'png';
+    const stickerResponse = await fetch(`${baseUrl}/sticker_${stickerId}.${stickerExtension}`);
+    assert.equal(stickerResponse.status, 200, `sticker_${stickerId}.${stickerExtension} should be served`);
+    assert.equal(stickerResponse.headers.get('content-type'), stickerId <= 8 ? 'image/webp' : 'image/png');
+    assert.deepEqual(
+      Array.from(new Uint8Array(await stickerResponse.arrayBuffer()).slice(0, stickerId <= 8 ? 4 : 8)),
+      stickerId <= 8
+        ? [82, 73, 70, 70]
+        : [137, 80, 78, 71, 13, 10, 26, 10]
+    );
+  }
+
+  const unknownTrack = await fetch(`${baseUrl}/music/not-allowed.mp3`);
+  assert.equal(unknownTrack.status, 404);
+});
+
+test('understands a direct request for a drink', () => {
+  assert.equal(detectMenuIntent('Recomiéndame una bebida, por favor'), 'bebidas');
+  assert.equal(selectMenuItem('bebidas', 'Quiero algo para tomar').category, 'bebidas');
+});
+
+test('keeps a meal request among food and combo items', () => {
+  assert.equal(detectMenuIntent('Quiero un plato para almorzar'), 'comida');
+  assert.notEqual(selectMenuItem('comida', 'Quiero comer algo').category, 'bebidas');
+});
+
+test('matches specifically named products without crossing categories', () => {
+  assert.equal(selectMenuItem('bebidas', 'Quiero Jugo de Maracuyá').id, '7');
+  assert.equal(selectMenuItem('comida', 'Recomiéndame ceviche').id, '3');
+  assert.equal(selectMenuItem('comida', 'Quiero el Combo Costeño').id, '8');
+  assert.equal(selectMenuItem('comida', 'Quiero el Combo Marino').id, '9');
+  assert.equal(selectMenuItem('bebidas', 'Quiero Agua San Luis').id, '10');
+});
+
+test('uses a reasonable general recommendation when the request has no category', () => {
+  assert.equal(detectMenuIntent('¿Qué me recomiendas?'), 'cualquiera');
+  assert.ok(selectMenuItem('cualquiera', '¿Qué me recomiendas?'));
+  assert.equal(detectMenuIntent('Tengo S/ 15'), 'cualquiera');
+  assert.equal(detectMenuIntent('¿A qué hora empieza el partido?'), 'ninguna');
+  assert.equal(selectMenuItem('ninguna', '¿A qué hora empieza el partido?'), null);
+});
+
+test('resolves explicit exclusions to the requested category', () => {
+  assert.equal(detectMenuIntent('No quiero bebida, prefiero un plato'), 'comida');
+  assert.equal(detectMenuIntent('No quiero un plato, solo una bebida'), 'bebidas');
+});
+
+test('answers simple menu questions locally without requesting web search', () => {
+  const drinks = getLocalMenuAnswer('¿Qué bebidas ofrecen hoy?');
+  assert.match(drinks.reply, /Chicha Morada Natural/);
+  assert.match(drinks.reply, /Jugo de Maracuyá/);
+  assert.equal(drinks.dishId, null);
+  assert.equal(shouldUseWebSearch('¿Qué bebidas ofrecen hoy?'), false);
+  assert.equal(getLocalMenuAnswer('¿Qué incluye el Combo Fitness?').dishId, '5');
+  assert.match(getLocalMenuAnswer('¿Qué incluye el Combo Costeño?').reply, /Agua San Luis 600ml/);
+  assert.match(getLocalMenuAnswer('¿Qué incluye el Combo Marino?').reply, /Jugo de maracuyá 500ml/);
+  assert.match(getLocalMenuAnswer('¿Qué bebidas ofrecen hoy?').reply, /Agua San Luis 600ml/);
+  assert.equal(getLocalMenuAnswer('Quiero una bebida').intent, 'bebidas');
+  assert.equal(getLocalMenuAnswer('Quiero un plato para almorzar').intent, 'comida');
+});
+
+test('reserves web search for current or complex questions', () => {
+  assert.equal(shouldUseWebSearch('¿Cuál es el tipo de cambio actual?'), true);
+  assert.equal(shouldUseWebSearch('Explica por qué cambia el clima y compara las causas principales'), true);
+  assert.equal(shouldUseWebSearch('Hola, ¿cómo estás?'), false);
+  assert.equal(shouldUseWebSearch('¿Qué incluye el Combo Fitness?'), false);
+  assert.equal(getLocalMenuAnswer('¿Cuál es el origen histórico del ceviche?'), null);
+  assert.equal(shouldUseWebSearch('¿Cuál es el origen histórico del ceviche?'), true);
+});
+
+test('uses one OpenAI-backed assistant with three distinct response personas', () => {
+  const personas = ['ChatGPT', 'Copilot', 'Gemini'].map(getAssistantPersona);
+  assert.equal(new Set(personas).size, 3);
+  assert.match(getAssistantPersona('Copilot'), /práctico/);
+  assert.match(getAssistantPersona('Gemini'), /creativo/);
+
+  const response = 'El Jugo de Maracuyá cuesta S/3.50.';
+  const styles = ['ChatGPT', 'Copilot', 'Gemini'].map((provider) => styleLocalAnswer(response, provider));
+  assert.equal(new Set(styles).size, 3);
+  assert.ok(styles.every((style) => style.includes(response)));
+});
+
+test('gives the rider support assistant empathetic, practical, and truthful guidance', () => {
+  const instructions = makeRiderSupportInstructions();
+  assert.match(instructions, /amabilidad, empatía y respeto/i);
+  assert.match(instructions, /No inventes funciones/i);
+  assert.match(instructions, /No solicites contraseñas/i);
+  assert.match(instructions, /lugar seguro/i);
+});
+
+test('routes rider support questions to AI with the dedicated support instructions', async (t) => {
+  const testDataDir = await mkdtemp(join(tmpdir(), 'altoque-rider-support-test-'));
+  let requestedUrl;
+  let requestedBody;
+  const server = createAlToqueServer({
+    ordersFile: join(testDataDir, 'orders.json'),
+    openAIApiKey: 'test-openai-api-key',
+    fetchImpl: async (url, options) => {
+      requestedUrl = new URL(url);
+      requestedBody = JSON.parse(options.body);
+      return new Response(JSON.stringify({ output_text: 'Siento que estés pasando por esto. Revisemos juntos qué puedes hacer.' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(async () => {
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    await rm(testDataDir, { recursive: true, force: true });
+  });
+
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const response = await fetch(`${baseUrl}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({
+      provider: 'ChatGPT',
+      assistantMode: 'rider-support',
+      text: 'Mi pedido se está demorando y estoy preocupado.',
+      history: [],
+      memory: ''
+    })
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).reply, 'Siento que estés pasando por esto. Revisemos juntos qué puedes hacer.');
+  assert.equal(requestedUrl.origin, 'https://api.openai.com');
+  assert.equal(requestedUrl.pathname, '/v1/responses');
+  assert.equal(requestedBody.tools, undefined);
+  assert.equal(requestedBody.input[0].role, 'developer');
+  assert.match(requestedBody.input[0].content, /amabilidad, empatía y respeto/i);
+  assert.match(requestedBody.input[0].content, /No inventes funciones/i);
+  assert.match(requestedBody.input[1].content, /Mi pedido se está demorando y estoy preocupado/);
+});
+
+test('falls back to the local Keras model for rider support when OpenAI is unavailable', async (t) => {
+  const testDataDir = await mkdtemp(join(tmpdir(), 'altoque-rider-support-fallback-test-'));
+  const requestedCalls = [];
+  const server = createAlToqueServer({
+    ordersFile: join(testDataDir, 'orders.json'),
+    openAIApiKey: 'test-openai-api-key',
+    fetchImpl: async (url, options) => {
+      const requestedUrl = new URL(url);
+      requestedCalls.push({ requestedUrl, options });
+      if (requestedUrl.hostname === 'api.openai.com') {
+        return new Response(JSON.stringify({ error: { message: 'La cuota de OpenAI se agotó.' } }), {
+          status: 429,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      return new Response(JSON.stringify({
+        respuesta: 'Siento que estés pasando por esta demora. Revisa el estado y contacta a soporte con el número del pedido.'
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(async () => {
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    await rm(testDataDir, { recursive: true, force: true });
+  });
+
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const response = await fetch(`${baseUrl}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({
+      provider: 'ChatGPT',
+      assistantMode: 'rider-support',
+      text: 'Mi pedido se demora, ¿qué hago?',
+      history: [],
+      memory: ''
+    })
+  });
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.equal(payload.engine, 'Keras local');
+  assert.equal(payload.fallbackFrom, 'OpenAI API');
+  assert.equal(payload.reply, 'Siento que estés pasando por esta demora. Revisa el estado y contacta a soporte con el número del pedido.');
+  assert.equal(requestedCalls.length, 2);
+  assert.equal(requestedCalls[0].requestedUrl.hostname, 'api.openai.com');
+  assert.equal(requestedCalls[1].requestedUrl.hostname, '127.0.0.1');
+  assert.equal(requestedCalls[1].requestedUrl.port, '5000');
+  assert.equal(requestedCalls[1].requestedUrl.pathname, '/preguntar');
+  assert.equal(requestedCalls[1].options.headers['Content-Type'], 'application/json');
+  const kerasBody = JSON.parse(requestedCalls[1].options.body);
+  assert.match(kerasBody.pregunta, /amabilidad, empatía y respeto/i);
+  assert.match(kerasBody.pregunta, /Mi pedido se demora, ¿qué hago\?/);
+});
+
+test('keeps previous conversation context separate from assistant instructions', () => {
+  const prompt = composePrompt(
+    'Responde en español.',
+    [{ sender: 'user', text: 'Prefiero opciones ligeras.' }],
+    'Me gustan las bebidas naturales.',
+    '¿Qué me recomiendas?',
+    null,
+    [{ name: 'Jugo de Maracuyá', quantity: 3 }, { name: 'Bowl de quinua', quantity: 1 }]
+  );
+  assert.equal(prompt[0].role, 'developer');
+  assert.equal(prompt[1].role, 'user');
+  assert.match(prompt[1].content, /bebidas naturales/);
+  assert.match(prompt[1].content, /opciones ligeras/);
+  assert.match(prompt[1].content, /¿Qué me recomiendas\?/);
+  assert.match(prompt[1].content, /"Jugo de Maracuyá": 3/);
+  assert.match(prompt[1].content, /"Bowl de quinua": 1/);
+});
+
+test('gives all three AI personas recent order history for direct purchase questions', async (t) => {
+  const testDataDir = await mkdtemp(join(tmpdir(), 'altoque-order-history-ai-test-'));
+  const requestedBodies = [];
+  const server = createAlToqueServer({
+    ordersFile: join(testDataDir, 'orders.json'),
+    reelsFile: join(testDataDir, 'reels.json'),
+    reelsVideosDir: join(testDataDir, 'reels-videos'),
+    openAIApiKey: 'test-openai-api-key',
+    fetchImpl: async (url, options) => {
+      requestedBodies.push({ url: new URL(url), body: JSON.parse(options.body) });
+      return new Response(JSON.stringify({
+        output_text: 'Según tus pedidos recientes, compras más Jugo de Maracuyá: 3 unidades.'
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(async () => {
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    await rm(testDataDir, { recursive: true, force: true });
+  });
+
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  for (const provider of ['ChatGPT', 'Copilot', 'Gemini']) {
+    const response = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+      body: JSON.stringify({
+        provider,
+        text: 'Según mis recientes pedidos, ¿qué es lo que más compro?',
+        history: [],
+        memory: '',
+        orderHistory: [
+          { name: 'Jugo de Maracuyá', quantity: 3 },
+          { name: 'Bowl de quinua', quantity: 1 }
+        ]
+      })
+    });
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    assert.equal(payload.reply, 'Según tus pedidos recientes, compras más Jugo de Maracuyá: 3 unidades.');
+    assert.equal(payload.dishId, null);
+  }
+
+  assert.equal(requestedBodies.length, 3);
+  for (const { url, body } of requestedBodies) {
+    assert.equal(url.origin, 'https://api.openai.com');
+    assert.match(body.input[0].content, /pregunta qué compra más, responde directamente/);
+    assert.match(body.input[1].content, /Resumen de los productos comprados en los 10 pedidos guardados más recientes/);
+    assert.match(body.input[1].content, /"Jugo de Maracuyá": 3/);
+    assert.match(body.input[1].content, /"Bowl de quinua": 1/);
+    assert.match(body.input[1].content, /Según mis recientes pedidos/);
+    assert.doesNotMatch(body.input[0].content, /Recomienda únicamente este producto/);
+  }
+});
+
+test('tells the AI not to invent purchase history when no orders are saved', async (t) => {
+  const testDataDir = await mkdtemp(join(tmpdir(), 'altoque-empty-order-history-ai-test-'));
+  let requestedBody;
+  const server = createAlToqueServer({
+    ordersFile: join(testDataDir, 'orders.json'),
+    reelsFile: join(testDataDir, 'reels.json'),
+    reelsVideosDir: join(testDataDir, 'reels-videos'),
+    openAIApiKey: 'test-openai-api-key',
+    fetchImpl: async (url, options) => {
+      requestedBody = JSON.parse(options.body);
+      return new Response(JSON.stringify({ output_text: 'Todavía no tienes pedidos guardados para identificarlo.' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(async () => {
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    await rm(testDataDir, { recursive: true, force: true });
+  });
+
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const response = await fetch(`${baseUrl}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({
+      provider: 'Gemini',
+      text: 'Según mis recientes pedidos, ¿qué es lo que más compro?',
+      history: [],
+      memory: '',
+      orderHistory: []
+    })
+  });
+  assert.equal(response.status, 200);
+  assert.match((await response.json()).reply, /no tienes pedidos guardados/i);
+  assert.match(requestedBody.input[0].content, /no tiene pedidos guardados recientes disponibles/);
+  assert.match(requestedBody.input[0].content, /no inventes compras/i);
+});
+
+test('omits personalized context when history and memory are disabled', () => {
+  const prompt = composePrompt('Responde en español.', [], '', 'Hola', null);
+  assert.equal(prompt[1].content, 'Mensaje actual:\nHola');
+});
+
+test('searches YouTube through the official API without exposing its key to the client', async (t) => {
+  const testDataDir = await mkdtemp(join(tmpdir(), 'altoque-youtube-test-'));
+  let requestedSearchUrl;
+  let requestedVideosUrl;
+  let upstreamStatus = 200;
+  let verificationStatus = 200;
+  let upstreamPayload = {
+    nextPageToken: 'page-two',
+    items: [
+      { id: { videoId: 'video123' }, snippet: { title: 'Canción de prueba', channelTitle: 'Artista de prueba' } },
+      { id: { videoId: 'private123' }, snippet: { title: 'Video privado', channelTitle: 'Canal privado' } },
+      { id: { videoId: 'region123' }, snippet: { title: 'Video no disponible en Perú', channelTitle: 'Canal regional' } }
+    ]
+  };
+  const verificationPayload = {
+    items: [
+      { id: 'video123', status: { privacyStatus: 'public', uploadStatus: 'processed', embeddable: true }, contentDetails: {} },
+      { id: 'private123', status: { privacyStatus: 'private', uploadStatus: 'processed', embeddable: true }, contentDetails: {} },
+      { id: 'region123', status: { privacyStatus: 'public', uploadStatus: 'processed', embeddable: true }, contentDetails: { regionRestriction: { allowed: ['US'] } } }
+    ]
+  };
+  const server = createAlToqueServer({
+    ordersFile: join(testDataDir, 'orders.json'),
+    youtubeApiKey: 'test-youtube-api-key',
+    fetchImpl: async (url) => {
+      const requestedUrl = new URL(url);
+      if (requestedUrl.pathname === '/youtube/v3/videos') {
+        requestedVideosUrl = requestedUrl;
+        return new Response(JSON.stringify(verificationPayload), { status: verificationStatus, headers: { 'Content-Type': 'application/json' } });
+      }
+      requestedSearchUrl = requestedUrl;
+      return new Response(JSON.stringify(upstreamPayload), { status: upstreamStatus, headers: { 'Content-Type': 'application/json' } });
+    }
+  });
+  const unconfiguredServer = createAlToqueServer({
+    ordersFile: join(testDataDir, 'unconfigured-orders.json'),
+    youtubeApiKey: ''
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  await new Promise((resolve, reject) => {
+    unconfiguredServer.once('error', reject);
+    unconfiguredServer.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(async () => {
+    await Promise.all([server, unconfiguredServer].map((activeServer) => new Promise((resolve, reject) => {
+      activeServer.close((error) => error ? reject(error) : resolve());
+    })));
+    await rm(testDataDir, { recursive: true, force: true });
+  });
+
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const unconfiguredBaseUrl = `http://127.0.0.1:${unconfiguredServer.address().port}`;
+  const unconfiguredResponse = await fetch(`${unconfiguredBaseUrl}/api/youtube/search?q=test`);
+  assert.equal(unconfiguredResponse.status, 503);
+  assert.match((await unconfiguredResponse.json()).error, /YOUTUBE_API_KEY/);
+
+  const invalidResponse = await fetch(`${baseUrl}/api/youtube/search?q=`);
+  assert.equal(invalidResponse.status, 400);
+
+  const response = await fetch(`${baseUrl}/api/youtube/search?q=${encodeURIComponent('canción de prueba')}`);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    videos: [{
+      id: 'video123',
+      title: 'Canción de prueba',
+      artist: 'Artista de prueba'
+    }],
+    nextPageToken: 'page-two'
+  });
+  assert.equal(requestedSearchUrl.origin, 'https://www.googleapis.com');
+  assert.equal(requestedSearchUrl.pathname, '/youtube/v3/search');
+  assert.equal(requestedSearchUrl.searchParams.get('q'), 'canción de prueba');
+  assert.equal(requestedSearchUrl.searchParams.get('key'), 'test-youtube-api-key');
+  assert.equal(requestedSearchUrl.searchParams.get('maxResults'), '50');
+  assert.equal(requestedSearchUrl.searchParams.get('videoEmbeddable'), 'true');
+  assert.equal(requestedSearchUrl.searchParams.get('regionCode'), 'PE');
+  assert.equal(requestedVideosUrl.pathname, '/youtube/v3/videos');
+  assert.equal(requestedVideosUrl.searchParams.get('part'), 'status,contentDetails');
+  assert.equal(requestedVideosUrl.searchParams.get('id'), 'video123,private123,region123');
+
+  await fetch(`${baseUrl}/api/youtube/search?q=test&pageToken=page-two`);
+  assert.equal(requestedSearchUrl.searchParams.get('pageToken'), 'page-two');
+
+  verificationStatus = 500;
+  const verificationFailureResponse = await fetch(`${baseUrl}/api/youtube/search?q=test`);
+  assert.equal(verificationFailureResponse.status, 502);
+  assert.match((await verificationFailureResponse.json()).error, /verificar qué videos están disponibles/i);
+  verificationStatus = 200;
+
+  upstreamStatus = 400;
+  upstreamPayload = {
+    error: {
+      status: 'INVALID_ARGUMENT',
+      message: 'API key not valid. Please pass a valid API key.',
+      errors: [{ reason: 'badRequest' }]
+    }
+  };
+  const invalidKeyResponse = await fetch(`${baseUrl}/api/youtube/search?q=test`);
+  assert.equal(invalidKeyResponse.status, 503);
+  assert.match((await invalidKeyResponse.json()).error, /YOUTUBE_API_KEY.*inválida/i);
+});
+
+test('shares customer orders with the rider queue and enforces delivery transitions', async (t) => {
+  const testDataDir = await mkdtemp(join(tmpdir(), 'altoque-server-test-'));
+  const server = createAlToqueServer({ ordersFile: join(testDataDir, 'orders.json') });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(async () => {
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    await rm(testDataDir, { recursive: true, force: true });
+  });
+
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  const invalidLocationResponse = await fetch(`${baseUrl}/api/location/reverse?lat=91&lon=0`);
+  assert.equal(invalidLocationResponse.status, 400);
+  assert.match((await invalidLocationResponse.json()).error, /coordenadas/i);
+
+  const orderResponse = await fetch(`${baseUrl}/api/orders`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Origin: baseUrl
+    },
+    body: JSON.stringify({
+      idempotencyKey: 'customer-checkout-123456',
+      customer: 'Armando',
+      items: [{
+        name: 'Iced Protein Matcha',
+        quantity: 2,
+        price: 22,
+        description: 'Bebida de matcha con proteína.',
+        image: 'data:image/svg+xml;charset=UTF-8,%3Csvg%3E%3C%2Fsvg%3E'
+      }],
+      pickupPoint: 'En la puerta principal',
+      paymentMethod: 'yape'
+    })
+  });
+  assert.equal(orderResponse.status, 201);
+  const { order } = await orderResponse.json();
+  assert.equal(order.customer, 'Armando');
+  assert.equal(order.total, 45);
+  assert.equal(order.payout, 2);
+  assert.equal(order.status, 'available');
+  assert.equal(order.items[0].description, 'Bebida de matcha con proteína.');
+  assert.equal(order.items[0].image, 'data:image/svg+xml;charset=UTF-8,%3Csvg%3E%3C%2Fsvg%3E');
+
+  const retryResponse = await fetch(`${baseUrl}/api/orders`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Origin: baseUrl
+    },
+    body: JSON.stringify({
+      idempotencyKey: 'customer-checkout-123456',
+      customer: 'Armando',
+      items: [{
+        name: 'Iced Protein Matcha',
+        quantity: 2,
+        price: 22,
+        description: 'Bebida de matcha con proteína.',
+        image: 'data:image/svg+xml;charset=UTF-8,%3Csvg%3E%3C%2Fsvg%3E'
+      }],
+      pickupPoint: 'En la puerta principal',
+      paymentMethod: 'yape'
+    })
+  });
+  assert.equal(retryResponse.status, 200);
+  assert.equal((await retryResponse.json()).order.id, order.id);
+
+  const queueResponse = await fetch(`${baseUrl}/api/orders`);
+  assert.equal(queueResponse.status, 200);
+  assert.deepEqual((await queueResponse.json()).orders.map((item) => item.id), [order.id]);
+
+  const pendingOrderResponse = await fetch(`${baseUrl}/api/orders/${order.id}`);
+  assert.equal(pendingOrderResponse.status, 200);
+  assert.equal((await pendingOrderResponse.json()).order.status, 'available');
+
+  const postAction = (action, details = {}) => fetch(`${baseUrl}/api/orders/${order.id}/action`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Origin: baseUrl
+    },
+    body: JSON.stringify({ action, ...details })
+  });
+  const postRiderLocation = (details) => fetch(`${baseUrl}/api/orders/${order.id}/location`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Origin: baseUrl
+    },
+    body: JSON.stringify(details)
+  });
+  const reviewOrder = (rating, comment) => fetch(`${baseUrl}/api/orders/${order.id}/review`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Origin: baseUrl
+    },
+    body: JSON.stringify({ rating, comment })
+  });
+  assert.equal((await reviewOrder(5, 'Muy amable')).status, 409);
+  const acceptResponse = await postAction('accept', { driverId: 'rider-armando', driverName: 'Armando' });
+  assert.equal(acceptResponse.status, 200);
+  assert.equal((await acceptResponse.json()).order.driverName, 'Armando');
+  const acceptedOrderResponse = await fetch(`${baseUrl}/api/orders/${order.id}`);
+  assert.equal(acceptedOrderResponse.status, 200);
+  assert.equal((await acceptedOrderResponse.json()).order.status, 'accepted');
+  assert.equal((await postAction('deliver')).status, 409);
+  assert.equal((await postRiderLocation({
+    driverId: 'rider-armando',
+    latitude: -12.1345,
+    longitude: -77.026,
+    accuracy: 10
+  })).status, 409);
+
+  const chatUrl = `${baseUrl}/api/orders/${order.id}/chat`;
+  const customerMessage = {
+    id: 'customer-message-123',
+    type: 'text',
+    text: 'Ya llegué',
+    createdAt: Date.now()
+  };
+  const sendMessageResponse = await fetch(chatUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({ role: 'customer', message: customerMessage })
+  });
+  assert.equal(sendMessageResponse.status, 201);
+
+  const riderChatResponse = await fetch(`${chatUrl}?role=rider&after=0&read=1`);
+  const riderChat = await riderChatResponse.json();
+  assert.equal(riderChat.messages[0].text, 'Ya llegué');
+  assert.equal(Number.isFinite(riderChat.messages[0].readAt), true);
+
+  const customerChatResponse = await fetch(`${chatUrl}?role=customer&after=${customerMessage.createdAt}`);
+  const customerChat = await customerChatResponse.json();
+  assert.deepEqual(customerChat.receipts, [{ id: customerMessage.id, readAt: riderChat.messages[0].readAt }]);
+
+  const sendAudioResponse = await fetch(chatUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({
+      role: 'rider',
+      message: {
+        id: 'rider-audio-message-123',
+        type: 'audio',
+        text: '',
+        createdAt: Date.now(),
+        attachment: {
+          name: 'Audio de prueba',
+          mimeType: 'audio/webm;codecs=opus',
+          data: 'data:audio/webm;codecs=opus;base64,AA=='
+        }
+      }
+    })
+  });
+  assert.equal(sendAudioResponse.status, 201);
+
+  const pickupResponse = await postAction('picked-up');
+  assert.equal(pickupResponse.status, 200);
+  const pickedUpOrder = (await pickupResponse.json()).order;
+  assert.equal(pickedUpOrder.status, 'picked_up');
+  assert.ok(Number.isFinite(pickedUpOrder.pickedUpAt));
+  assert.equal((await postRiderLocation({
+    driverId: 'another-rider',
+    latitude: -12.1345,
+    longitude: -77.026,
+    accuracy: 10
+  })).status, 403);
+  assert.equal((await postRiderLocation({
+    driverId: 'rider-armando',
+    latitude: 91,
+    longitude: -77.026,
+    accuracy: 10
+  })).status, 400);
+  const locationResponse = await postRiderLocation({
+    driverId: 'rider-armando',
+    latitude: -12.1345,
+    longitude: -77.026,
+    accuracy: 10
+  });
+  assert.equal(locationResponse.status, 200);
+  const { location } = await locationResponse.json();
+  assert.equal(location.latitude, -12.1345);
+  assert.equal(location.longitude, -77.026);
+  assert.ok(Number.isFinite(location.updatedAt));
+  const orderWithLocationResponse = await fetch(`${baseUrl}/api/orders/${order.id}`);
+  assert.deepEqual((await orderWithLocationResponse.json()).location, location);
+  assert.equal((await reviewOrder(5, 'Muy amable')).status, 409);
+  const deliveryResponse = await postAction('deliver');
+  assert.equal(deliveryResponse.status, 200);
+  const deliveredOrder = (await deliveryResponse.json()).order;
+  assert.equal(deliveredOrder.status, 'delivered');
+  assert.ok(Number.isFinite(deliveredOrder.deliveredAt));
+  assert.ok(deliveredOrder.deliveredAt >= pickedUpOrder.pickedUpAt);
+  assert.equal((await postAction('deliver')).status, 409);
+  const deliveredOrderResponse = await fetch(`${baseUrl}/api/orders/${order.id}`);
+  assert.equal((await deliveredOrderResponse.json()).location, null);
+  const reviewResponse = await reviewOrder(5, 'Muy amable y puntual');
+  assert.equal(reviewResponse.status, 201);
+  assert.equal((await reviewOrder(4, 'Otra opinión')).status, 409);
+  const riderProfile = await (await fetch(`${baseUrl}/api/rider/profile?driverId=rider-armando`)).json();
+  assert.equal(riderProfile.profile.name, 'Armando');
+  assert.equal(riderProfile.profile.ratingAverage, 5);
+  assert.equal(riderProfile.profile.reviewCount, 1);
+  assert.equal(riderProfile.profile.reviews[0].comment, 'Muy amable y puntual');
+  const orderDetails = await (await fetch(`${baseUrl}/api/orders/${order.id}`)).json();
+  assert.equal(orderDetails.order.review.rating, 5);
+  assert.equal((await postAction('accept')).status, 409);
+  assert.deepEqual((await (await fetch(`${baseUrl}/api/orders`)).json()).orders, []);
+
+  const audioTermsResponse = await fetch(`${baseUrl}/audiomack-player-terms.html`);
+  assert.equal(audioTermsResponse.status, 200);
+  assert.match(audioTermsResponse.headers.get('content-type'), /text\/html/);
+  const audioTermsHtml = await audioTermsResponse.text();
+  assert.match(audioTermsHtml, /Términos de uso del reproductor Audiomack/);
+  assert.match(audioTermsHtml, /https:\/\/audiomack\.com\/about\/terms-of-service/);
+
+  const coinResponse = await fetch(`${baseUrl}/Moneda%20Al%20Toque.html?coinEmbed=1`);
+  assert.equal(coinResponse.status, 200);
+  assert.match(coinResponse.headers.get('content-type'), /text\/html/);
+  assert.equal(coinResponse.headers.get('x-frame-options'), 'SAMEORIGIN');
+  const coinHtml = await coinResponse.text();
+  assert.match(coinHtml, /coinEmbed/);
+  const embeddedCoinBuilder = coinHtml.match(/function buildEmbeddedCoin\(onReady\)\s*\{([\s\S]*?)\r?\n  \}\r?\n\r?\n  function resize\(\)/)?.[1];
+  assert.ok(embeddedCoinBuilder, 'embedded coin renderer should be defined');
+  assert.match(embeddedCoinBuilder, /build\(\)/);
+  assert.match(coinHtml, /var N = 2048/);
+  assert.match(coinHtml, /neon: '#a51e2a'/);
+  assert.match(coinHtml, /#45484d/);
+  assert.match(coinHtml, /background-color: transparent !important/);
+  assert.match(coinHtml, /renderer\.setClearAlpha\(0\)/);
+  assert.match(coinHtml, /premultipliedAlpha: true/);
+  assert.match(coinHtml, /preserveDrawingBuffer: true/);
+  assert.match(coinHtml, /renderer\.setClearColor\(0x000000, 0\)/);
+  assert.doesNotMatch(coinHtml, /coinColor/);
+
+  for (const asset of ['coin-front-red.png']) {
+    const photoResponse = await fetch(`${baseUrl}/${asset}`);
+    assert.equal(photoResponse.status, 200);
+    assert.match(photoResponse.headers.get('content-type'), /image\/png/);
+    assert.ok((await photoResponse.arrayBuffer()).byteLength > 10_000);
+  }
+});
+
+test('rejects rider-declined orders and allows cancellation until pickup', async (t) => {
+  const testDataDir = await mkdtemp(join(tmpdir(), 'altoque-cancel-test-'));
+  const expiredOrder = {
+    id: 'UPCH-EXPIRED-ORDER',
+    customer: 'Cliente UPCH',
+    items: [{ name: 'Pedido vencido', quantity: 1, price: 10 }],
+    pickupPoint: 'En la puerta principal',
+    paymentMethod: 'yape',
+    subtotal: 10,
+    total: 11,
+    payout: 1,
+    status: 'available',
+    createdAt: Date.now() - 60_001
+  };
+  const acceptedOrder = {
+    ...expiredOrder,
+    id: 'UPCH-ACCEPTED-ORDER',
+    status: 'accepted',
+    createdAt: Date.now() - 3_600_000,
+    driverId: 'rider-1',
+    driverName: 'Repartidor'
+  };
+  const pickedUpOrder = {
+    ...acceptedOrder,
+    id: 'UPCH-PICKED-UP-ORDER',
+    status: 'picked_up',
+    pickedUpAt: Date.now()
+  };
+  await writeFile(join(testDataDir, 'orders.json'), JSON.stringify({ orders: [expiredOrder, acceptedOrder, pickedUpOrder] }));
+  const server = createAlToqueServer({ ordersFile: join(testDataDir, 'orders.json') });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(async () => {
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    await rm(testDataDir, { recursive: true, force: true });
+  });
+
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const postAction = (orderId, action, details = {}) => fetch(`${baseUrl}/api/orders/${orderId}/action`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({ action, ...details })
+  });
+  const createResponse = await fetch(`${baseUrl}/api/orders`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({
+      customer: 'Cliente UPCH',
+      items: [{ name: 'Pedido cancelable', quantity: 1, price: 10 }],
+      pickupPoint: 'En la puerta principal',
+      paymentMethod: 'yape'
+    })
+  });
+  assert.equal(createResponse.status, 201);
+  const { order } = await createResponse.json();
+
+  const declineCreateResponse = await fetch(`${baseUrl}/api/orders`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({
+      customer: 'Cliente UPCH',
+      items: [{ name: 'Pedido rechazable', quantity: 1, price: 8 }],
+      pickupPoint: 'En la puerta principal',
+      paymentMethod: 'yape'
+    })
+  });
+  assert.equal(declineCreateResponse.status, 201);
+  const { order: declinedOrder } = await declineCreateResponse.json();
+  const declineResponse = await postAction(declinedOrder.id, 'decline');
+  assert.equal(declineResponse.status, 200);
+  assert.equal((await declineResponse.json()).order.status, 'rejected');
+  assert.equal((await postAction(declinedOrder.id, 'accept', { driverId: 'rider-1', driverName: 'Repartidor' })).status, 409);
+
+  const cancellationResponse = await postAction(order.id, 'cancel');
+  assert.equal(cancellationResponse.status, 200);
+  assert.equal((await cancellationResponse.json()).order.status, 'cancelled');
+  assert.equal((await postAction(order.id, 'accept', { driverId: 'rider-1', driverName: 'Repartidor' })).status, 409);
+
+  const expiredCancellationResponse = await postAction(expiredOrder.id, 'cancel');
+  assert.equal(expiredCancellationResponse.status, 409);
+  assert.match((await expiredCancellationResponse.json()).error, /antes de que el repartidor confirme el recojo/i);
+
+  const acceptedCancellationResponse = await postAction(acceptedOrder.id, 'cancel');
+  assert.equal(acceptedCancellationResponse.status, 200);
+  assert.equal((await acceptedCancellationResponse.json()).order.status, 'cancelled');
+  assert.equal((await postAction(acceptedOrder.id, 'picked-up')).status, 409);
+
+  const pickedUpCancellationResponse = await postAction(pickedUpOrder.id, 'cancel');
+  assert.equal(pickedUpCancellationResponse.status, 409);
+  assert.match((await pickedUpCancellationResponse.json()).error, /antes de que el repartidor confirme el recojo/i);
+  const queueResponse = await fetch(`${baseUrl}/api/orders`);
+  assert.deepEqual((await queueResponse.json()).orders.map(({ id }) => id), [expiredOrder.id]);
+
+  const pageResponse = await fetch(`${baseUrl}/`);
+  const html = await pageResponse.text();
+  assert.match(html, /const canCancelOrder = orderStatus === 'accepted'/);
+  assert.match(html, /Puedes cancelar si aún no se confirmó el recojo/);
+  assert.match(html, /El pedido \$\{activeOrder\.id\} fue cancelado y se quitó de tu ruta/);
+});
+
+test('accepts Gorritos redemptions without a cash total or service fee', async (t) => {
+  const testDataDir = await mkdtemp(join(tmpdir(), 'altoque-gorritos-test-'));
+  const server = createAlToqueServer({ ordersFile: join(testDataDir, 'orders.json') });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(async () => {
+    await new Promise((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+    await rm(testDataDir, { recursive: true, force: true });
+  });
+
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const submitRedemption = (details) => fetch(`${baseUrl}/api/orders`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({
+      customer: 'Armando',
+      items: [{ id: '1', name: 'Lomo saltado', quantity: 1, price: 0 }],
+      pickupPoint: 'En la puerta principal',
+      paymentMethod: 'gorritos',
+      gorritosSpent: 12,
+      ...details
+    })
+  });
+
+  const redemptionResponse = await submitRedemption({ idempotencyKey: 'gorritos-redeem-123456' });
+  assert.equal(redemptionResponse.status, 201);
+  const { order } = await redemptionResponse.json();
+  assert.equal(order.paymentMethod, 'gorritos');
+  assert.equal(order.gorritosSpent, 12);
+  assert.equal(order.subtotal, 0);
+  assert.equal(order.total, 0);
+  assert.equal(order.items[0].id, '1');
+
+  const retryResponse = await submitRedemption({ idempotencyKey: 'gorritos-redeem-123456' });
+  assert.equal(retryResponse.status, 200);
+  assert.equal((await retryResponse.json()).order.id, order.id);
+
+  const cashChargeResponse = await submitRedemption({
+    idempotencyKey: 'gorritos-cash-123456',
+    items: [{ id: '1', name: 'Lomo saltado', quantity: 1, price: 12 }]
+  });
+  assert.equal(cashChargeResponse.status, 400);
+
+  const missingPointsResponse = await submitRedemption({
+    idempotencyKey: 'gorritos-points-123456',
+    gorritosSpent: 0
+  });
+  assert.equal(missingPointsResponse.status, 400);
+
+  const cashWithPointsResponse = await fetch(`${baseUrl}/api/orders`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: baseUrl },
+    body: JSON.stringify({
+      idempotencyKey: 'cash-with-gorritos-123456',
+      items: [{ id: '1', name: 'Lomo saltado', quantity: 1, price: 12 }],
+      pickupPoint: 'En la puerta principal',
+      paymentMethod: 'efectivo',
+      gorritosSpent: 12
+    })
+  });
+  assert.equal(cashWithPointsResponse.status, 400);
+});
